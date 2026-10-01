@@ -10,6 +10,10 @@ target/release/copytrader run    --data data            # runs until stopped
 target/release/copytrader report --data data [--hours 24]
 ```
 
+Needs Rust 1.85+ (`rust-version` in Cargo.toml; the lock file is resolved for it).
+The running paper copy uses a copy of the binary (`data/bin/copytrader.exe`), so a rebuild
+does not fail on a locked `target/release/copytrader.exe`.
+
 `run` options: `--stake 1` (USD per buy), `--cap 0.02` (max price over the wallet's),
 `--sell-floor 0.05`, `--market-gap-h 6`.
 

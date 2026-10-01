@@ -4,6 +4,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -17,6 +18,11 @@ use crate::log;
 const RTDS: &str = "wss://ws-live-data.polymarket.com";
 /// The stream sends many trades a second: this long without one means it has stalled.
 const SILENCE_S: u64 = 15;
+/// The stream can also go on delivering other trades while dropping our wallets' ones (seen
+/// 2026-10-01 for ~40 min). Trades the REST read-back finds first are counted here; this many
+/// within one check makes the stream reconnect.
+pub static STREAM_MISSES: AtomicU64 = AtomicU64::new(0);
+const MISSES_TO_RECONNECT: u64 = 3;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
@@ -74,10 +80,20 @@ pub async fn run_stream(wallets: Arc<RwLock<HashSet<String>>>, tx: mpsc::Sender<
                 }
                 log!("stream: connected");
                 let mut ping = tokio::time::interval(Duration::from_secs(10));
+                let mut check = tokio::time::interval(Duration::from_secs(30));
+                let mut misses = STREAM_MISSES.load(Ordering::Relaxed);
                 loop {
                     tokio::select! {
                         _ = ping.tick() => {
                             if sink.send(Message::Ping(Vec::new())).await.is_err() { break; }
+                        }
+                        _ = check.tick() => {
+                            let now_misses = STREAM_MISSES.load(Ordering::Relaxed);
+                            if now_misses - misses >= MISSES_TO_RECONNECT {
+                                log!("stream: {} of our wallets' trades came only over REST, reconnecting", now_misses - misses);
+                                break;
+                            }
+                            misses = now_misses;
                         }
                         msg = tokio::time::timeout(Duration::from_secs(SILENCE_S), read.next()) => {
                             let text = match msg {

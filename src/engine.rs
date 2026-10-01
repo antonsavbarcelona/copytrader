@@ -152,6 +152,10 @@ impl Engine {
                 return;
             }
             s.1.push_back(tkey);
+            // New to us yet found over REST well after the trade: the stream dropped it.
+            if seen.source == Source::Rest && seen.recv - t.ts > 20.0 {
+                crate::stream::STREAM_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             if s.1.len() > 200_000 {
                 if let Some(old) = s.1.pop_front() {
                     s.0.remove(&old);
