@@ -28,6 +28,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::sync::{Mutex, Semaphore, mpsc};
 
+use crate::db;
+
 use crate::api::{Api, Market, Side, Trade, now};
 use crate::config::Config;
 use crate::fill::{self, Fill};
@@ -69,6 +71,7 @@ pub struct Engine {
     pending: Mutex<HashMap<(String, String, bool), f64>>,
     rechecks: Mutex<HashSet<String>>,
     limit: Semaphore,
+    db: Option<mpsc::UnboundedSender<db::Write>>,
     /// Trades from before this run started (the first read-back reaches 10 minutes back) are
     /// not copies we could have made, nor misses.
     started: f64,
@@ -84,11 +87,14 @@ fn round(x: f64, d: i32) -> f64 {
 }
 
 impl Engine {
-    pub fn open(cfg: Config, api: Api) -> anyhow::Result<Arc<Self>> {
+    /// `db_state`: the snapshot saved in the database, which wins over the local file (the
+    /// local disk does not survive a redeploy).
+    pub fn open(cfg: Config, api: Api, db: Option<mpsc::UnboundedSender<db::Write>>, db_state: Option<String>)
+        -> anyhow::Result<Arc<Self>> {
         std::fs::create_dir_all(&cfg.data_dir)?;
         let state_path = cfg.data_dir.join("state.json");
-        let state: State = std::fs::read_to_string(&state_path)
-            .ok()
+        let state: State = db_state
+            .or_else(|| std::fs::read_to_string(&state_path).ok())
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
         log!("state: {} lots held", state.lots.values().filter(|l| l.shares > 1e-6).count());
@@ -103,6 +109,7 @@ impl Engine {
             pending: Mutex::new(HashMap::new()),
             rechecks: Mutex::new(HashSet::new()),
             limit: Semaphore::new(16),
+            db,
             started: now(),
         }))
     }
@@ -112,14 +119,33 @@ impl Engine {
         let mut f = self.events.lock().await;
         let _ = writeln!(f, "{ev}");
         let _ = f.flush();
+        if let Some(db) = &self.db {
+            let _ = db.send(db::Write::Event(ev));
+        }
     }
 
-    pub async fn save(&self) {
-        let st = self.state.lock().await;
-        if let Ok(s) = serde_json::to_string(&*st) {
-            let tmp = self.state_path.with_extension("tmp");
-            if std::fs::write(&tmp, s).is_ok() {
-                let _ = std::fs::rename(&tmp, &self.state_path);
+    /// Saves the state to the local file and, with `to_db`, to the database. Drops what is no
+    /// longer needed first, so a week's run does not grow without bound.
+    pub async fn save(&self, to_db: bool) {
+        let t = now();
+        self.pending.lock().await.retain(|_, ts| t - *ts < 3600.0);
+        let json = {
+            let mut st = self.state.lock().await;
+            st.lots.retain(|_, l| l.shares > 1e-6);
+            let State { lots, market_copied, their_peak, our_peak } = &mut *st;
+            market_copied.retain(|_, at| t - *at <= self.cfg.market_gap_s + 3600.0);
+            their_peak.retain(|k, _| lots.contains_key(k));
+            our_peak.retain(|k, _| lots.contains_key(k));
+            serde_json::to_string(&*st)
+        };
+        let Ok(s) = json else { return };
+        let tmp = self.state_path.with_extension("tmp");
+        if std::fs::write(&tmp, &s).is_ok() {
+            let _ = std::fs::rename(&tmp, &self.state_path);
+        }
+        if to_db {
+            if let Some(db) = &self.db {
+                let _ = db.send(db::Write::State(s));
             }
         }
     }
@@ -390,14 +416,25 @@ impl Engine {
     /// Pays out held outcomes whose market has settled.
     pub async fn settle_once(&self) {
         let lots: Vec<Lot> = self.state.lock().await.lots.values().filter(|l| l.shares > 1e-6).cloned().collect();
-        let mut by_token: HashMap<String, Option<Market>> = HashMap::new();
-        for lot in &lots {
-            if !by_token.contains_key(&lot.token) {
-                by_token.insert(lot.token.clone(), self.api.market(&lot.token, 0.0).await.ok());
+        let mut tokens: Vec<String> = lots.iter().map(|l| l.token.clone()).collect();
+        tokens.sort();
+        tokens.dedup();
+        // Only closed markets come back: one request per 40 held outcomes.
+        let mut by_token: HashMap<String, Market> = HashMap::new();
+        for chunk in tokens.chunks(40) {
+            match self.api.closed_markets(chunk).await {
+                Ok(ms) => {
+                    for m in ms {
+                        for t in &m.tokens {
+                            by_token.insert(t.clone(), m.clone());
+                        }
+                    }
+                }
+                Err(e) => log!("settle: market read failed: {e}"),
             }
         }
         for lot in lots {
-            let Some(Some(m)) = by_token.get(&lot.token) else { continue };
+            let Some(m) = by_token.get(&lot.token) else { continue };
             if !m.settled() {
                 continue;
             }

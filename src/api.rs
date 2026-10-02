@@ -210,6 +210,14 @@ impl Api {
         Ok(m)
     }
 
+    /// The closed markets among those of `tokens` (at most ~40: they all go in the URL).
+    pub async fn closed_markets(&self, tokens: &[String]) -> Result<Vec<Market>> {
+        let q: Vec<String> = tokens.iter().map(|t| format!("clob_token_ids={t}")).collect();
+        // gamma returns 20 markets unless told otherwise.
+        let v = self.get(&format!("{GAMMA}/markets?{}&closed=true&limit={}", q.join("&"), tokens.len() * 2)).await?;
+        Ok(v.as_array().map(|a| a.iter().filter_map(Self::parse_market).collect()).unwrap_or_default())
+    }
+
     /// What the wallet holds of the outcome now (not settled positions). The API lags about
     /// a minute behind trades.
     pub async fn position(&self, wallet: &str, token: &str) -> Result<f64> {

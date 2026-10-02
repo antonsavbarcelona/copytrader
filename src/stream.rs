@@ -23,6 +23,8 @@ const SILENCE_S: u64 = 15;
 /// within one check makes the stream reconnect.
 pub static STREAM_MISSES: AtomicU64 = AtomicU64::new(0);
 const MISSES_TO_RECONNECT: u64 = 3;
+/// Unix seconds a followed wallet's trade last came in, by either path (the run's watchdog).
+pub static LAST_TRADE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Source {
@@ -110,6 +112,7 @@ pub async fn run_stream(wallets: Arc<RwLock<HashSet<String>>>, tx: mpsc::Sender<
                                 continue;
                             }
                             if let Some(trade) = parse(p) {
+                                LAST_TRADE.store(now() as u64, Ordering::Relaxed);
                                 let _ = tx.send(Seen { trade, recv: now(), source: Source::Stream }).await;
                             }
                         }
@@ -135,6 +138,9 @@ pub async fn run_poller(api: Api, wallets: Arc<RwLock<HashSet<String>>>, tx: mps
             match api.trades_since(&w, now() - 600.0).await {
                 Ok(trades) => {
                     let recv = now();
+                    if !trades.is_empty() {
+                        LAST_TRADE.store(recv as u64, Ordering::Relaxed);
+                    }
                     for trade in trades {
                         let _ = tx.send(Seen { trade, recv, source: Source::Rest }).await;
                     }

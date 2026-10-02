@@ -63,8 +63,14 @@ pub async fn run(cfg: &Config, args: &[String]) -> Result<()> {
         i += 1;
     }
     let since = since_h.map(|h| now() - h * 3600.0).unwrap_or(0.0);
-    let text = std::fs::read_to_string(cfg.data_dir.join("events.jsonl")).unwrap_or_default();
-    let events: Vec<Value> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    // DATABASE_URL set: the server's events from Postgres; else the local file.
+    let events: Vec<Value> = match std::env::var("DATABASE_URL").ok().filter(|u| !u.is_empty()) {
+        Some(url) => crate::db::load_events(&crate::db::connect(&url).await?).await?,
+        None => {
+            let text = std::fs::read_to_string(cfg.data_dir.join("events.jsonl")).unwrap_or_default();
+            text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()
+        }
+    };
     let buys: Vec<&Value> = events.iter().filter(|e| e["kind"] == "buy" && f(&e["trade_ts"]) >= since).collect();
     let mut keys: HashMap<String, Key> = HashMap::new();
     for e in &events {
