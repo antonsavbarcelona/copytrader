@@ -10,8 +10,10 @@ pub struct Config {
     pub stake_usd: f64,
     /// A buy takes the book up to this much above the wallet's price ...
     pub buy_cap_pct: f64,
-    /// ... and always at least one tick above it (on cheap outcomes the % rounds to nothing).
+    /// ... and always at least one tick above it (on cheap outcomes the % rounds to nothing) ...
     pub buy_cap_min_ticks: f64,
+    /// ... and at least this many dollars a share above it (0: off). The live copy's slippage.
+    pub buy_cap_abs: f64,
     /// A sale takes the bids down to this much under the wallet's price.
     pub sell_floor_pct: f64,
     /// Fills of one wallet order arriving within this window are one trade.
@@ -38,6 +40,8 @@ pub struct Config {
     pub top_n: i64,
     pub top_days: f64,
     pub top_min_closed: i64,
+    /// The live copy pays up to this much a share over the wallet's price.
+    pub live_cap_abs: f64,
 }
 
 impl Default for Config {
@@ -47,6 +51,7 @@ impl Default for Config {
             stake_usd: 1.0,
             buy_cap_pct: 0.02,
             buy_cap_min_ticks: 1.0,
+            buy_cap_abs: 0.0,
             sell_floor_pct: 0.05,
             join_s: 5.0,
             market_gap_s: 6.0 * 3600.0,
@@ -59,6 +64,7 @@ impl Default for Config {
             top_n: 10,
             top_days: 3.0,
             top_min_closed: 15,
+            live_cap_abs: 0.03,
         }
     }
 }
@@ -80,6 +86,7 @@ impl Config {
                 "--data" => c.data_dir = PathBuf::from(v()?),
                 "--stake" => c.stake_usd = v()?.parse()?,
                 "--cap" => c.buy_cap_pct = v()?.parse()?,
+                "--live-cap-abs" => c.live_cap_abs = v()?.parse()?,
                 "--sell-floor" => c.sell_floor_pct = v()?.parse()?,
                 "--market-gap-h" => c.market_gap_s = v()?.parse::<f64>()? * 3600.0,
                 "--top" => c.top_n = v()?.parse()?,

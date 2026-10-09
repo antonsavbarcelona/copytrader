@@ -24,11 +24,11 @@ pub fn on_tick(p: f64, tick: f64, buy: bool) -> f64 {
 }
 
 /// The highest price a copied buy may pay: `cap_pct` above the wallet's price on the tick
-/// grid, and never less than `min_ticks` ticks above it.
-pub fn buy_cap(wallet_price: f64, tick: f64, cap_pct: f64, min_ticks: f64) -> f64 {
+/// grid, and never less than `min_ticks` ticks nor `abs` dollars above it.
+pub fn buy_cap(wallet_price: f64, tick: f64, cap_pct: f64, min_ticks: f64, abs: f64) -> f64 {
     let base = on_tick((wallet_price / tick).round() * tick, tick, true);
     let pct = on_tick(base * (1.0 + cap_pct), tick, true);
-    pct.max(on_tick(base + min_ticks * tick, tick, true))
+    pct.max(on_tick(base + min_ticks * tick, tick, true)).max(on_tick(base + abs, tick, true))
 }
 
 /// The lowest price a copied sale may take.
@@ -76,11 +76,15 @@ mod tests {
 
     #[test]
     fn cap_is_pct_or_one_tick() {
-        assert_eq!(buy_cap(0.35, 0.01, 0.02, 1.0), 0.36); // 2% rounds to 0.35: one tick up
-        assert_eq!(buy_cap(0.75, 0.01, 0.02, 1.0), 0.76);
-        assert_eq!(buy_cap(0.60, 0.01, 0.10, 1.0), 0.66);
-        assert_eq!(buy_cap(0.6099999, 0.01, 0.02, 1.0), 0.62); // the stream's 0.6099.. is the tick 0.61
-        assert_eq!(buy_cap(0.99, 0.01, 0.02, 1.0), 0.99);
+        assert_eq!(buy_cap(0.35, 0.01, 0.02, 1.0, 0.0), 0.36); // 2% rounds to 0.35: one tick up
+        assert_eq!(buy_cap(0.75, 0.01, 0.02, 1.0, 0.0), 0.76);
+        assert_eq!(buy_cap(0.60, 0.01, 0.10, 1.0, 0.0), 0.66);
+        assert_eq!(buy_cap(0.6099999, 0.01, 0.02, 1.0, 0.0), 0.62); // the stream's 0.6099.. is the tick 0.61
+        assert_eq!(buy_cap(0.99, 0.01, 0.02, 1.0, 0.0), 0.99);
+        // live: up to 3 cents over the wallet
+        assert_eq!(buy_cap(0.3800000000314177, 0.01, 0.02, 1.0, 0.03), 0.41);
+        assert_eq!(buy_cap(0.97, 0.01, 0.02, 1.0, 0.03), 0.99);
+        assert_eq!(buy_cap(0.60, 0.01, 0.10, 1.0, 0.03), 0.66); // the % is wider here
         assert_eq!(sell_floor(0.40, 0.01, 0.05), 0.38);
     }
 

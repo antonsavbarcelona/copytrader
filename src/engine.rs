@@ -268,7 +268,7 @@ impl Engine {
             }
         };
         let book_at = now();
-        let cap = fill::buy_cap(t.price, book.tick, self.cfg.buy_cap_pct, self.cfg.buy_cap_min_ticks);
+        let cap = fill::buy_cap(t.price, book.tick, self.cfg.buy_cap_pct, self.cfg.buy_cap_min_ticks, self.cfg.buy_cap_abs);
         let mut retried = false;
         let mut order = serde_json::Value::Null;
         let mut missed = "cap";

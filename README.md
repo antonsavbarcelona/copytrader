@@ -56,7 +56,8 @@ Live copies only the `--top` (10) wallets whose paper copies returned the most o
 `--top-days` (3; closed positions, at least `--top-min-closed` 15, positive), picked again
 every 6 h, with its own trade stream and read-back (a 10-wallet round takes seconds);
 wallets whose lots it holds stay followed for their sales. Buys are FAK market orders capped
-like the paper ones, skipped when the cash is short; sales are FAK, never more than the
+at up to 3 cents a share over the wallet's price (`--live-cap-abs 0.03`; the paper cap when
+that is wider), skipped when the cash is short; sales are FAK, never more than the
 account holds; positions are held to resolution, then redeemed the way polymarket.com does
 it (the proxy wallet calls Polymarket's collateral adapter, `redeemPositions(pUSD, 0,
 condition, [1, 2])`, through `relayer-v2.polymarket.com`: no POL needed), tried again every

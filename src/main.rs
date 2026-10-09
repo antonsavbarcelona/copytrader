@@ -247,11 +247,17 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
             Err(e) => log!("live: OFF, account connect failed: {e:#}"),
             Ok(l) => {
                 let l = Arc::new(l);
-                let lcfg = config::Config { live: true, data_dir: cfg.data_dir.join("live"), ..cfg.clone() };
+                let lcfg = config::Config {
+                    live: true,
+                    data_dir: cfg.data_dir.join("live"),
+                    buy_cap_abs: cfg.live_cap_abs,
+                    ..cfg.clone()
+                };
                 let engine = engine::Engine::open(lcfg.clone(), api.clone(), db_tx.clone(), live_state, Some(l.clone()))?;
                 let cash = l.cash().await.unwrap_or(0.0);
                 *engine.cash.lock().await = cash;
-                log!("live: ON, signer {} proxy wallet {} cash ${cash:.2}, ${} a copy", l.signer_address(), l.funder, lcfg.stake_usd);
+                log!("live: ON, signer {} proxy wallet {} cash ${cash:.2}, ${} a copy, up to +{} a share over the wallet",
+                    l.signer_address(), l.funder, lcfg.stake_usd, lcfg.buy_cap_abs);
                 let wallets: Wallets = Arc::new(RwLock::new(HashSet::new()));
                 refresh_top(&lcfg, url, &engine, &wallets).await;
                 tasks.extend(spawn_copier("live", &lcfg, &api, &engine, &wallets));
