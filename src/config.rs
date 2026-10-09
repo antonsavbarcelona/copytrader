@@ -30,6 +30,14 @@ pub struct Config {
     pub wallets_refresh_s: u64,
     /// How often held outcomes are checked for settlement.
     pub settle_every_s: u64,
+    /// Real orders (live.rs) instead of paper fills, events to their own tables.
+    pub live: bool,
+    /// Live: copy only the `top_n` wallets whose paper copies did best over `top_days`
+    /// (positive return, at least `top_min_closed` closed positions), picked again every
+    /// `wallets_refresh_s`.
+    pub top_n: i64,
+    pub top_days: f64,
+    pub top_min_closed: i64,
 }
 
 impl Default for Config {
@@ -47,23 +55,36 @@ impl Default for Config {
             poll_gap_ms: 700,
             wallets_refresh_s: 6 * 3600,
             settle_every_s: 300,
+            live: false,
+            top_n: 10,
+            top_days: 3.0,
+            top_min_closed: 15,
         }
     }
 }
 
 impl Config {
-    /// `--data DIR --stake 1 --cap 0.02 --sell-floor 0.05` over the defaults.
+    /// `--data DIR --stake 1 --cap 0.02 --sell-floor 0.05 --live --top 10 --top-days 3` over
+    /// the defaults.
     pub fn from_args(args: &[String]) -> anyhow::Result<Self> {
         let mut c = Self::default();
         let mut i = 0;
         while i < args.len() {
             let v = || args.get(i + 1).cloned().ok_or_else(|| anyhow::anyhow!("{} needs a value", args[i]));
+            if args[i] == "--live" {
+                c.live = true;
+                i += 1;
+                continue;
+            }
             match args[i].as_str() {
                 "--data" => c.data_dir = PathBuf::from(v()?),
                 "--stake" => c.stake_usd = v()?.parse()?,
                 "--cap" => c.buy_cap_pct = v()?.parse()?,
                 "--sell-floor" => c.sell_floor_pct = v()?.parse()?,
                 "--market-gap-h" => c.market_gap_s = v()?.parse::<f64>()? * 3600.0,
+                "--top" => c.top_n = v()?.parse()?,
+                "--top-days" => c.top_days = v()?.parse()?,
+                "--top-min-closed" => c.top_min_closed = v()?.parse()?,
                 other => anyhow::bail!("unknown option {other}"),
             }
             i += 2;

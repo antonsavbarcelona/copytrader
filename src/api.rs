@@ -35,6 +35,8 @@ pub struct Market {
     /// Taker fee per share: rate * (p * (1 - p)) ^ exponent.
     pub fee_rate: f64,
     pub fee_exp: f64,
+    /// Neg-risk markets redeem through their own adapter.
+    pub neg_risk: bool,
 }
 
 impl Market {
@@ -183,6 +185,7 @@ impl Api {
             game_start,
             fee_rate: if fees { sched.get("rate").map(num).unwrap_or(0.07) } else { 0.0 },
             fee_exp: sched.get("exponent").map(num).filter(|e| *e > 0.0).unwrap_or(1.0),
+            neg_risk: m["negRisk"].as_bool().unwrap_or(false),
         })
     }
 
@@ -292,7 +295,7 @@ mod tests {
     fn settled_needs_final_prices() {
         let mut m = Market {
             condition: String::new(), question: String::new(), tokens: vec!["a".into(), "b".into()],
-            prices: vec![1.0, 0.0], closed: true, game_start: None, fee_rate: 0.0, fee_exp: 1.0,
+            prices: vec![1.0, 0.0], closed: true, game_start: None, fee_rate: 0.0, fee_exp: 1.0, neg_risk: false,
         };
         assert!(m.settled());
         m.prices = vec![0.5, 0.5];

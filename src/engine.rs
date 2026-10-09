@@ -17,6 +17,12 @@
 //!          price. A sale under $1 that is not most of the position is held (exchange minimum).
 //!   settle held outcomes are paid out at the final price once the market settles.
 //! Fees: the market's taker fee per share, rate * (p(1-p))^exponent, on every fill.
+//!
+//! Live (`--live`): the same decisions, executed with real orders (live.rs): a FAK buy capped
+//! at the cap (no retry: the rest would be under the exchange's $1 minimum), skipped when the
+//! cash is short; a FAK sale floored at the floor, never more than the account holds; a
+//! resolved market redeemed through Polymarket's relayer. Fees are the market's formula
+//! applied to the fill (an estimate: the exchange does not report them per order).
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Write;
@@ -33,6 +39,7 @@ use crate::db;
 use crate::api::{Api, Market, Side, Trade, now};
 use crate::config::Config;
 use crate::fill::{self, Fill};
+use crate::live::Live;
 use crate::log;
 use crate::stream::{Seen, Source};
 
@@ -75,6 +82,10 @@ pub struct Engine {
     /// Trades from before this run started (the first read-back reaches 10 minutes back) are
     /// not copies we could have made, nor misses.
     started: f64,
+    /// Real orders instead of paper fills.
+    pub live: Option<Arc<Live>>,
+    /// Live: the account's spendable cash, refreshed from the exchange and lowered by each buy.
+    pub cash: Mutex<f64>,
 }
 
 fn fill_json(f: &Fill) -> serde_json::Value {
@@ -89,8 +100,8 @@ fn round(x: f64, d: i32) -> f64 {
 impl Engine {
     /// `db_state`: the snapshot saved in the database, which wins over the local file (the
     /// local disk does not survive a redeploy).
-    pub fn open(cfg: Config, api: Api, db: Option<mpsc::UnboundedSender<db::Write>>, db_state: Option<String>)
-        -> anyhow::Result<Arc<Self>> {
+    pub fn open(cfg: Config, api: Api, db: Option<mpsc::UnboundedSender<db::Write>>, db_state: Option<String>,
+        live: Option<Arc<Live>>) -> anyhow::Result<Arc<Self>> {
         std::fs::create_dir_all(&cfg.data_dir)?;
         let state_path = cfg.data_dir.join("state.json");
         let state: State = db_state
@@ -111,6 +122,8 @@ impl Engine {
             limit: Semaphore::new(16),
             db,
             started: now(),
+            live,
+            cash: Mutex::new(0.0),
         }))
     }
 
@@ -120,7 +133,7 @@ impl Engine {
         let _ = writeln!(f, "{ev}");
         let _ = f.flush();
         if let Some(db) = &self.db {
-            let _ = db.send(db::Write::Event(ev));
+            let _ = db.send(db::Write::Event(ev, self.live.is_some()));
         }
     }
 
@@ -145,7 +158,7 @@ impl Engine {
         }
         if to_db {
             if let Some(db) = &self.db {
-                let _ = db.send(db::Write::State(s));
+                let _ = db.send(db::Write::State(s, self.live.is_some()));
             }
         }
     }
@@ -253,9 +266,34 @@ impl Engine {
         };
         let book_at = now();
         let cap = fill::buy_cap(t.price, book.tick, self.cfg.buy_cap_pct, self.cfg.buy_cap_min_ticks);
-        let mut f = fill::buy(&book.asks, stake, cap, fee);
         let mut retried = false;
-        if f.usd < stake * 0.5 {
+        let mut order = serde_json::Value::Null;
+        let mut missed = "cap";
+        let mut f = Fill::default();
+        if let Some(live) = &self.live {
+            let mut cash = self.cash.lock().await;
+            if *cash < stake {
+                missed = "no cash";
+                order = json!({"cash": round(*cash, 2)});
+            } else {
+                // Held while the order is out, so two copies cannot spend the same dollar.
+                match live.buy(&t.token, stake, cap).await {
+                    Ok((lf, r)) => {
+                        f = lf;
+                        f.fee = f.avg().map(|p| f.shares * fee(p)).unwrap_or(0.0);
+                        *cash -= f.usd;
+                        order = json!({"id": r.order_id, "status": format!("{:?}", r.status)});
+                    }
+                    Err(e) => {
+                        missed = "order";
+                        order = json!({"error": e.to_string()});
+                    }
+                }
+            }
+        } else {
+            f = fill::buy(&book.asks, stake, cap, fee);
+        }
+        if self.live.is_none() && f.usd < stake * 0.5 {
             // The live executor's single retry once the FAK came back short.
             tokio::time::sleep(Duration::from_secs(1)).await;
             if let Ok(b2) = self.api.book(&t.token).await {
@@ -269,7 +307,7 @@ impl Engine {
             }
         }
         let filled = f.usd >= 0.01;
-        let shadow = (f.usd < stake * 0.5).then(|| fill::buy(&book.asks, stake, 1.0, fee));
+        let shadow = (self.live.is_none() && f.usd < stake * 0.5).then(|| fill::buy(&book.asks, stake, 1.0, fee));
         let k = key(&t.wallet, &t.token);
         if filled {
             let mut st = self.state.lock().await;
@@ -288,7 +326,7 @@ impl Engine {
         let vs = f.avg().map(|p| round((p / t.price - 1.0) * 1e4, 1));
         log!("{} BUY {:.3} -> {} {}", &t.wallet[..10], t.price,
             if filled { format!("filled ${:.2} @ {:.3} ({:+.0} bps)", f.usd, f.avg().unwrap_or(0.0), vs.unwrap_or(0.0)) }
-            else { format!("missed (cap {cap})") },
+            else if missed == "cap" { format!("missed (cap {cap})") } else { format!("missed ({missed}) {order}") },
             t.title.chars().take(50).collect::<String>());
         self.write(json!({
             "kind": "buy", "wallet": t.wallet, "token": t.token, "condition": t.condition, "title": t.title,
@@ -298,8 +336,8 @@ impl Engine {
             "phase": Self::phase(market.as_ref(), t.ts), "game_start": market.as_ref().and_then(|m| m.game_start),
             "tick": book.tick, "cap": cap, "best_ask": book.asks.first().map(|a| a.0),
             "fill": fill_json(&f), "vs_wallet_bps": vs, "retried": retried,
-            "missed": if filled { serde_json::Value::Null } else { json!("cap") },
-            "shadow": shadow.map(|s| fill_json(&s)),
+            "missed": if filled { serde_json::Value::Null } else { json!(missed) },
+            "shadow": shadow.map(|s| fill_json(&s)), "order": order,
         })).await;
         if filled {
             // The wallet's position once the API has caught up: the reference for its sales.
@@ -392,7 +430,29 @@ impl Engine {
             }
         };
         let floor = fill::sell_floor(t.price, book.tick, self.cfg.sell_floor_pct);
-        let f = fill::sell(&book.bids, qty, floor, fee);
+        let mut order = serde_json::Value::Null;
+        let f = match &self.live {
+            Some(live) => {
+                // Never more than the account holds (the exchange may have kept fees in shares).
+                let qty = match live.shares(&t.token).await {
+                    Ok(have) => qty.min(have),
+                    Err(_) => qty,
+                };
+                match live.sell(&t.token, qty, floor).await {
+                    Ok((mut lf, r)) => {
+                        lf.fee = lf.avg().map(|p| lf.shares * fee(p)).unwrap_or(0.0);
+                        *self.cash.lock().await += lf.usd;
+                        order = json!({"id": r.order_id, "status": format!("{:?}", r.status)});
+                        lf
+                    }
+                    Err(e) => {
+                        order = json!({"error": e.to_string()});
+                        Fill::default()
+                    }
+                }
+            }
+            None => fill::sell(&book.bids, qty, floor, fee),
+        };
         let after = {
             let mut st = self.state.lock().await;
             let lot = st.lots.get_mut(&k);
@@ -409,6 +469,7 @@ impl Engine {
         let mut ev = base;
         ev["floor"] = json!(floor);
         ev["fill"] = fill_json(&f);
+        ev["order"] = order;
         ev["held_after"] = json!(round(after, 6));
         self.write(ev).await;
     }
@@ -433,12 +494,33 @@ impl Engine {
                 Err(e) => log!("settle: market read failed: {e}"),
             }
         }
+        // Live: one redeem per market pays out every outcome the account holds in it.
+        let mut redeemed: HashMap<String, Result<String, String>> = HashMap::new();
         for lot in lots {
             let Some(m) = by_token.get(&lot.token) else { continue };
             if !m.settled() {
                 continue;
             }
             let price = m.price_of(&lot.token).unwrap_or(0.0);
+            let mut redeem_tx = serde_json::Value::Null;
+            if let Some(live) = &self.live {
+                // A lost outcome is worth nothing: no transaction for it.
+                if price > 0.0 {
+                    let cond = if lot.condition.is_empty() { m.condition.clone() } else { lot.condition.clone() };
+                    if !redeemed.contains_key(&cond) {
+                        let r = live.redeem(&cond, m.neg_risk).await.map_err(|e| e.to_string());
+                        if let Err(e) = &r {
+                            log!("redeem failed (tried again next round): {e} {}", lot.title.chars().take(50).collect::<String>());
+                        }
+                        redeemed.insert(cond.clone(), r);
+                    }
+                    match &redeemed[&cond] {
+                        Ok(tx) => redeem_tx = json!(tx),
+                        // Kept: the next round tries again.
+                        Err(_) => continue,
+                    }
+                }
+            }
             let k = key(&lot.wallet, &lot.token);
             let shares = {
                 let mut st = self.state.lock().await;
@@ -447,8 +529,11 @@ impl Engine {
             if shares > 1e-6 {
                 log!("{} settled at {price}: {:.2} sh -> ${:.2} {}", &lot.wallet[..10], shares, shares * price,
                     lot.title.chars().take(50).collect::<String>());
+                if self.live.is_some() {
+                    *self.cash.lock().await += shares * price;
+                }
                 self.write(json!({"kind": "settle", "wallet": lot.wallet, "token": lot.token, "title": lot.title,
-                    "price": price, "shares": round(shares, 6), "usd": round(shares * price, 6)})).await;
+                    "price": price, "shares": round(shares, 6), "usd": round(shares * price, 6), "redeem_tx": redeem_tx})).await;
             }
         }
     }

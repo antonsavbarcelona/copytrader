@@ -2,7 +2,7 @@
 name = "copytrader"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [dependencies]
 anyhow = "1"
@@ -13,3 +13,9 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+polymarket_client_sdk_v2 = { version = "0.8", features = ["clob"] }
+alloy = { version = "1.6", default-features = false, features = ["signer-local", "sol-types", "std"] }
+base64 = "0.22"
+hmac = "0.12"
+sha2 = "0.10"
+rustls = { version = "0.23", default-features = false, features = ["ring"] }

@@ -36,6 +36,33 @@ Report on the server's data from anywhere, with the database's public URL:
 DATABASE_URL=postgresql://... target/release/copytrader report
 ```
 
+## Live (real orders)
+
+The same service also copies for real once the account's keys are in its variables (next to
+`DATABASE_URL`; nothing else to change):
+
+- `PRIVATE_KEY` (or `POLYMARKET_PRIVATE_KEY`): the email/Magic account's exported key.
+- `RELAYER_API_KEY`, `RELAYER_ADDRESS`: polymarket.com, Settings -> Relayer API keys (the
+  relayer pays the redeems' gas). Builder keys (`POLY_BUILDER_API_KEY`, `_SECRET`,
+  `_PASSPHRASE`) work instead.
+- Optional: `POLYMARKET_FUNDER` (the proxy wallet, derived from the key otherwise),
+  `POLYGON_RPC`, `LIVE=off` to leave the keys unused.
+
+The log says `live: ON, signer .. proxy wallet .. cash $..` at the start (or why it is off;
+the paper copy runs either way). `copytrader check` shows the account and cash without an
+order, `copytrader test-trade TOKEN [USD]` makes a real buy and sells it back.
+
+Live copies only the `--top` (10) wallets whose paper copies returned the most over the last
+`--top-days` (3; closed positions, at least `--top-min-closed` 15, positive), picked again
+every 6 h, with its own trade stream and read-back (a 10-wallet round takes seconds);
+wallets whose lots it holds stay followed for their sales. Buys are FAK market orders capped
+like the paper ones, skipped when the cash is short; sales are FAK, never more than the
+account holds; positions are held to resolution, then redeemed the way polymarket.com does
+it (the proxy wallet calls Polymarket's collateral adapter, `redeemPositions(pUSD, 0,
+condition, [1, 2])`, through `relayer-v2.polymarket.com`: no POL needed), tried again every
+5 minutes if it fails. Events go to `live_events` and DIR/live, the state to `state` id
+`live`; `copytrader report --live` reports on them.
+
 ### Tables
 
 - `events`: one row per event (`kind` buy / sell / settle, `wallet`, `token`, `title`, the
