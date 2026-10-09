@@ -29,9 +29,9 @@ use hmac::{Hmac, Mac};
 use polymarket_client_sdk_v2::POLYGON;
 use polymarket_client_sdk_v2::auth::Normal;
 use polymarket_client_sdk_v2::auth::state::Authenticated;
-use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
+use polymarket_client_sdk_v2::clob::types::request::{BalanceAllowanceRequest, TradesRequest};
 use polymarket_client_sdk_v2::clob::types::response::PostOrderResponse;
-use polymarket_client_sdk_v2::clob::types::{Amount, AssetType, OrderType, Side, SignatureType};
+use polymarket_client_sdk_v2::clob::types::{Amount, AssetType, OrderStatusType, OrderType, Side, SignatureType};
 use polymarket_client_sdk_v2::clob::{Client, Config};
 use polymarket_client_sdk_v2::types::{Address, Decimal, U256};
 
@@ -129,7 +129,7 @@ impl Live {
             .await?;
         check(&r)?;
         // A buy makes dollars and takes shares.
-        Ok((Fill { shares: f(r.taking_amount), usd: f(r.making_amount), fee: 0.0 }, r))
+        self.settled(r, |r| Fill { shares: f(r.taking_amount), usd: f(r.making_amount), fee: 0.0 }).await
     }
 
     /// `shares` at market, taking no less than `floor` a share.
@@ -148,11 +148,74 @@ impl Live {
             .await?;
         check(&r)?;
         // A sale makes shares and takes dollars.
-        Ok((Fill { shares: f(r.making_amount), usd: f(r.taking_amount), fee: 0.0 }, r))
+        self.settled(r, |r| Fill { shares: f(r.making_amount), usd: f(r.taking_amount), fee: 0.0 }).await
     }
 }
 
 impl Live {
+    /// The order's fill. A taker order on an in-play sports market comes back `Delayed` (the
+    /// exchange holds it a few seconds) with nothing matched yet: then its final state is read
+    /// back, and the fill is its trades. `r.status` is set to the final state.
+    async fn settled(&self, mut r: PostOrderResponse, now: impl Fn(&PostOrderResponse) -> Fill)
+        -> Result<(Fill, PostOrderResponse)> {
+        if !matches!(r.status, OrderStatusType::Delayed | OrderStatusType::Live) {
+            return Ok((now(&r), r));
+        }
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            let Ok(o) = self.client.order(&r.order_id).await else { continue };
+            if matches!(o.status, OrderStatusType::Delayed | OrderStatusType::Live) {
+                continue;
+            }
+            let shares = f(o.size_matched);
+            // Dollars from its trades (each at its own price); the order's limit if unreadable.
+            let mut usd = 0.0;
+            let mut got = 0.0;
+            for id in &o.associate_trades {
+                if let Ok(p) = self.client.trades(&TradesRequest::builder().id(id.clone()).build(), None).await {
+                    for t in p.data {
+                        usd += f(t.size) * f(t.price);
+                        got += f(t.size);
+                    }
+                }
+            }
+            if (got - shares).abs() > 1e-6 {
+                usd = shares * f(o.price);
+            }
+            r.status = o.status;
+            return Ok((Fill { shares, usd, fee: 0.0 }, r));
+        }
+        bail!("order {} still {:?} after 30 s", r.order_id, r.status)
+    }
+
+    /// The resolved markets the proxy wallet holds a winning outcome in (also any bought
+    /// outside this run's records), as (condition, neg risk). From the public data API.
+    pub async fn won_unredeemed(&self) -> Result<Vec<(String, bool, String)>> {
+        let v: serde_json::Value = self
+            .http
+            .get(format!("https://data-api.polymarket.com/positions?user={}&sizeThreshold=0&limit=500", self.funder))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let mut out: Vec<(String, bool, String)> = v
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter(|p| p["redeemable"].as_bool() == Some(true) && p["curPrice"].as_f64().unwrap_or(0.0) > 0.0)
+                    .filter_map(|p| {
+                        Some((p["conditionId"].as_str()?.to_string(), p["negativeRisk"].as_bool().unwrap_or(false),
+                            p["title"].as_str().unwrap_or("").to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        out.sort();
+        out.dedup_by(|a, b| a.0 == b.0);
+        Ok(out)
+    }
+
     /// Redeems every outcome of a resolved market the proxy wallet holds (winners pay out in
     /// pUSD, losers burn), through the relayer. Returns the transaction hash once mined.
     pub async fn redeem(&self, condition: &str, neg_risk: bool) -> Result<String> {

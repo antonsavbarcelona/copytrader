@@ -86,6 +86,8 @@ pub struct Engine {
     pub live: Option<Arc<Live>>,
     /// Live: the account's spendable cash, refreshed from the exchange and lowered by each buy.
     pub cash: Mutex<f64>,
+    /// Live: markets redeemed by the sweep in this run (the positions API lags behind).
+    swept: Mutex<HashSet<String>>,
 }
 
 fn fill_json(f: &Fill) -> serde_json::Value {
@@ -124,6 +126,7 @@ impl Engine {
             started: now(),
             live,
             cash: Mutex::new(0.0),
+            swept: Mutex::new(HashSet::new()),
         }))
     }
 
@@ -534,6 +537,29 @@ impl Engine {
                 }
                 self.write(json!({"kind": "settle", "wallet": lot.wallet, "token": lot.token, "title": lot.title,
                     "price": price, "shares": round(shares, 6), "usd": round(shares * price, 6), "redeem_tx": redeem_tx})).await;
+            }
+        }
+        // Live: won outcomes held outside these lots (a fill the run lost track of, a manual
+        // buy) are redeemed too, once per run per market.
+        if let Some(live) = &self.live {
+            match live.won_unredeemed().await {
+                Ok(list) => {
+                    for (cond, neg_risk, title) in list {
+                        if redeemed.contains_key(&cond) || !self.swept.lock().await.insert(cond.clone()) {
+                            continue;
+                        }
+                        let r = live.redeem(&cond, neg_risk).await;
+                        log!("sweep redeem {}: {}", title.chars().take(50).collect::<String>(),
+                            match &r { Ok(tx) => tx.clone(), Err(e) => format!("failed: {e}") });
+                        if r.is_err() {
+                            // Tried again next round.
+                            self.swept.lock().await.remove(&cond);
+                        }
+                        self.write(json!({"kind": "redeem", "condition": cond, "title": title,
+                            "redeem_tx": r.as_ref().ok(), "error": r.as_ref().err().map(|e| e.to_string())})).await;
+                    }
+                }
+                Err(e) => log!("sweep: positions read failed: {e}"),
             }
         }
     }
