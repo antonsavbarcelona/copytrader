@@ -274,17 +274,25 @@ impl Engine {
         let mut missed = "cap";
         let mut f = Fill::default();
         if let Some(live) = &self.live {
-            let mut cash = self.cash.lock().await;
-            if *cash < stake {
+            // The stake is set aside while the order is out (a delayed one takes seconds), so
+            // two copies cannot spend the same dollar; what it did not spend comes back.
+            let reserved = {
+                let mut cash = self.cash.lock().await;
+                let ok = *cash >= stake;
+                if ok {
+                    *cash -= stake;
+                } else {
+                    order = json!({"cash": round(*cash, 2)});
+                }
+                ok
+            };
+            if !reserved {
                 missed = "no cash";
-                order = json!({"cash": round(*cash, 2)});
             } else {
-                // Held while the order is out, so two copies cannot spend the same dollar.
                 match live.buy(&t.token, stake, cap).await {
                     Ok((lf, r)) => {
                         f = lf;
                         f.fee = f.avg().map(|p| f.shares * fee(p)).unwrap_or(0.0);
-                        *cash -= f.usd;
                         order = json!({"id": r.order_id, "status": format!("{:?}", r.status)});
                     }
                     Err(e) => {
@@ -292,6 +300,7 @@ impl Engine {
                         order = json!({"error": e.to_string()});
                     }
                 }
+                *self.cash.lock().await += stake - f.usd;
             }
         } else {
             f = fill::buy(&book.asks, stake, cap, fee);

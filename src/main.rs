@@ -132,6 +132,16 @@ async fn main() -> anyhow::Result<()> {
         println!("signer {}\nproxy wallet {}\ncash ${:.2}", l.signer_address(), l.funder, l.cash().await?);
         return Ok(());
     }
+    if cmd == "order" {
+        // An order's state as the exchange reports it; read only.
+        let l = live::Live::connect().await?;
+        let id = rest.first().context("order ID [TOKEN]")?;
+        println!("{}", l.order_debug(id).await);
+        if let Some(token) = rest.get(1) {
+            println!("our buys of it (last day): {:?}", l.public_fill(token, true, api::now() - 86400.0).await?);
+        }
+        return Ok(());
+    }
     if cmd == "test-trade" {
         return test_trade(rest.first().cloned().context("test-trade TOKEN [USD]")?, rest.get(1).cloned()).await;
     }
