@@ -54,21 +54,23 @@ nothing in round one; it is kept for analysis and read again after a profitable 
 Every wallet judged goes to `scouted` (with why it failed), and is judged again after 7
 days. `copytrader scout` runs round one now and prints the verdicts without saving anything.
 
-## Round two: a week on paper
+## Round two: paper, checked daily
 
 A wallet that passes goes on trial (`trials`) and is copied on paper from then on (one
-already copied starts its week up to 7 days back, so those copies count). When its week is
-over (checked hourly) it is judged on the copies of the positions it opened that week (sold,
-settled, or held at the market's price now); its own profit that week is kept next to them.
+already copied starts its trial up to 7 days back, so those copies count). Once a week on
+trial it is checked **every day** on its **last 7 days** (rolling, not calendar weeks): the
+copies of the positions it opened in them (sold, settled, or held at the market's price
+now); its own profit in them is kept next to them.
 
 - Copies in profit on 3+ copies: B, read again, tells steady from lucky. **Steady** (traded
   120+ days; 3 of the last 4 months up and the 4 months in profit; 60%+ of their weeks up;
   best day under half the profit) goes on the **golden list**; **lucky** is dropped.
-- Otherwise another week; after two such weeks it is `review` (look at what it trades; it
-  gets a third week), after three it is `rotated` and no longer followed.
+- Otherwise it stays on trial; from day 14 without such a check it is `review` (look at what
+  it trades), from day 21 `rotated` and no longer followed.
 
-Golden wallets stay on paper and are judged on: two losing weeks of copies in a row send one
-back to trial. Every week's numbers (and B when read) are kept in `trials.weeks`.
+Golden wallets stay on paper and are checked daily too: their last 7 days of copies in loss
+and the 7 before them as well send one back to a new trial. The last 60 checks (and B when
+read) are kept in `trials.weeks`.
 
 ## Live (real orders)
 
@@ -86,7 +88,7 @@ The log says `live: ON, signer .. proxy wallet .. cash $..` at the start (or why
 the paper copy runs either way). `copytrader check` shows the account and cash without an
 order, `copytrader test-trade TOKEN [USD]` makes a real buy and sells it back.
 
-Live copies the golden wallets (at most `--top` 10, the best copies of last week first),
+Live copies the golden wallets (at most `--top` 10, the best copies of the last 7 days first),
 picked again every 6 h, with its own trade stream and read-back (a 10-wallet round takes seconds);
 wallets whose lots it holds stay followed for their sales. Buys are FAK market orders capped
 at up to 3 cents a share over the wallet's price (`--live-cap-abs 0.03`; the paper cap when

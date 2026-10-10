@@ -1,20 +1,19 @@
-//! Round two: the week on paper. Every big player from round one (scout.rs) is copied on
-//! paper and judged week by week on the copies of the trades it made that week (sold,
-//! settled, or still held at the market's price now); its own profit that week is kept next
-//! to them.
+//! Round two: paper. Every big player from round one (scout.rs) is copied on paper and,
+//! once a week old, checked every day on its last 7 days (not calendar weeks): the copies of
+//! the trades it opened in them (sold, settled, or still held at the market's price now), its
+//! own profit next to them.
 //!
 //! - Copies in profit, on `MIN_BUYS` or more: the copy worked. Then the wallet's record
 //!   (metric B, scout::record, read again now) tells steady from lucky: steady goes on the
 //!   golden list, which the live copy draws from; lucky is dropped (`rotated`).
-//! - Otherwise (the copies lost, or it hardly traded): another week; after two such weeks it
-//!   is up for review (`review`: look at what it does; it gets a third week), after three it
-//!   is rotated out and no longer followed.
+//! - Otherwise it stays on trial; 14 days without a check that worked put it up for review
+//!   (`review`: look at what it does), 21 rotate it out (no longer followed).
 //!
-//! A golden wallet stays on paper and is judged on as well: two weeks in a row of copies in
-//! loss send it back to trial.
+//! A golden wallet stays on paper and is checked daily as well: its last 7 days in loss and
+//! the 7 before them too send it back to trial (a new one from that day).
 //!
-//! The state is the `trials` table (db.rs); every week's numbers and record are kept in
-//! `weeks`.
+//! The state is the `trials` table (db.rs): `week_start` is when the trial started, `week`
+//! the week of it now; the last 60 checks are kept in `weeks`.
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -25,6 +24,8 @@ use crate::log;
 use crate::scout::{self, Criteria, Judged, at};
 
 const WEEK: f64 = 7.0 * 86400.0;
+/// The checks kept per wallet.
+const KEEP: i32 = 60;
 /// Fewer copies than this in a week tell nothing.
 const MIN_BUYS: i64 = 3;
 
@@ -74,7 +75,7 @@ pub async fn followed(c: &Client) -> Result<Vec<String>> {
     Ok(c.query("SELECT wallet FROM trials WHERE status <> 'rotated'", &[]).await?.iter().map(|r| r.get(0)).collect())
 }
 
-/// The golden list, the copies' return in their last week first: (wallet, name, return), up to
+/// The golden list, the copies' return over their last 7 days first: (wallet, name, return), up to
 /// `n`.
 pub async fn golden(c: &Client, n: i64) -> Result<Vec<(String, Option<String>, f64)>> {
     Ok(c.query(
@@ -142,48 +143,58 @@ fn copies_worked(w: &Value) -> Option<bool> {
     (w["buys"].as_i64().unwrap_or(0) >= MIN_BUYS).then(|| w["copy_pnl"].as_f64().unwrap_or(0.0) > 0.0)
 }
 
-/// The next status and strikes after a week; `steady` is the record's verdict, read only when
-/// the copies worked (Err: why it looks like luck).
-fn next(status: &str, strikes: i32, w: &Value, steady: Result<(), &str>) -> (&'static str, i32, &'static str) {
+/// The status after a check: the last 7 days (`w`), the 7 before them (`prev`, golden only)
+/// and how many days the trial has run; `steady` is the record's verdict, read only when the
+/// copies worked (Err: why it looks like luck). Returns (status, failed weeks, verdict).
+fn next(status: &str, days: f64, w: &Value, prev: Option<&Value>, steady: Result<(), &str>) -> (&'static str, i32, &'static str) {
     let worked = copies_worked(w);
     if status == "golden" {
+        let before = prev.and_then(copies_worked);
         return match worked {
-            None => ("golden", strikes, "idle"),
+            None => ("golden", 0, "idle"),
             Some(true) => ("golden", 0, "pass"),
-            Some(false) if strikes >= 1 => ("trial", 0, "fail"),
-            Some(false) => ("golden", strikes + 1, "fail"),
+            Some(false) if before == Some(false) => ("trial", 0, "fail"),
+            Some(false) => ("golden", 1, "fail"),
         };
     }
     let verdict = match worked {
         Some(true) if steady.is_ok() => return ("golden", 0, "pass"),
-        Some(true) => return ("rotated", strikes, "luck"),
+        Some(true) => return ("rotated", 0, "luck"),
         Some(false) => "fail",
         None => "idle",
     };
-    match strikes + 1 {
-        1 => ("trial", 1, verdict),
+    let weeks = (days / 7.0).floor() as i32;
+    match weeks {
+        ..=1 => ("trial", weeks.max(1), verdict),
         2 => ("review", 2, verdict),
-        s => ("rotated", s, verdict),
+        n => ("rotated", n, verdict),
     }
 }
 
-/// Every wallet whose week is over is judged on it; returns how many weeks were judged.
+/// Every wallet on trial a week or more (and every golden one) is checked on its last 7 days;
+/// returns how many were checked.
 pub async fn evaluate(c: &Client, api: &Api, crit: &Criteria) -> Result<usize> {
     let due = c
         .query(
-            "SELECT wallet, name, status, strikes, week, extract(epoch FROM week_start)::float8 FROM trials
+            "SELECT wallet, name, status, extract(epoch FROM week_start)::float8 FROM trials
              WHERE status <> 'rotated' AND week_start + interval '7 days' <= now() ORDER BY week_start",
             &[],
         )
         .await?;
     let mut done = 0;
     for r in due {
-        let (wallet, name, status, strikes, week, from): (String, Option<String>, String, i32, i32, f64) =
-            (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4), r.get(5));
-        let mut w = match week_result(c, api, &wallet, from).await {
-            Ok(w) => w,
+        let (wallet, name, status, start): (String, Option<String>, String, f64) = (r.get(0), r.get(1), r.get(2), r.get(3));
+        let t = crate::api::now();
+        let days = (t - start) / 86400.0;
+        let read = async {
+            let w = week_result(c, api, &wallet, t - WEEK).await?;
+            let prev = if status == "golden" { Some(week_result(c, api, &wallet, t - 2.0 * WEEK).await?) } else { None };
+            anyhow::Ok((w, prev))
+        };
+        let (mut w, prev) = match read.await {
+            Ok(x) => x,
             Err(e) => {
-                log!("trial: {wallet} week read failed: {e}");
+                log!("trial: {wallet} check failed, tomorrow again: {e}");
                 continue;
             }
         };
@@ -196,29 +207,35 @@ pub async fn evaluate(c: &Client, api: &Api, crit: &Criteria) -> Result<usize> {
                     w["record"] = b;
                 }
                 Err(e) => {
-                    log!("trial: {wallet} record read failed, judged next hour: {e}");
+                    log!("trial: {wallet} record read failed, tomorrow again: {e}");
                     continue;
                 }
             }
         }
-        let (st, strikes, verdict) = next(&status, strikes, &w, steady);
+        let (st, strikes, verdict) = next(&status, days, &w, prev.as_ref(), steady);
         if verdict == "luck" {
             w["luck"] = json!(steady.err().unwrap_or(""));
         }
-        w["week"] = json!(week);
+        w["day"] = json!(days.floor());
         w["verdict"] = json!(verdict);
         w["status"] = json!(st);
-        log!("trial: {} week {week} {verdict} -> {st}: copies {:+.2} on {} buys, the wallet {:+.0}",
-            name.as_deref().unwrap_or(&wallet), w["copy_pnl"].as_f64().unwrap_or(0.0), w["buys"],
-            w["trader_pnl"].as_f64().unwrap_or(0.0));
+        if st != status {
+            log!("trial: {} day {:.0} {verdict}: {status} -> {st}, copies {:+.2} on {} buys in 7 days, the wallet {:+.0}",
+                name.as_deref().unwrap_or(&wallet), days.floor(), w["copy_pnl"].as_f64().unwrap_or(0.0), w["buys"],
+                w["trader_pnl"].as_f64().unwrap_or(0.0));
+        }
+        // Back from golden: a new trial from today.
+        let restart = status == "golden" && st == "trial";
         c.execute(
-            "UPDATE trials SET status = $2, strikes = $3, week = week + 1,
-               week_start = week_start + interval '7 days', updated = now(), last = $4,
-               weeks = weeks || jsonb_build_array($4::jsonb),
+            "UPDATE trials SET status = $2, strikes = $3, updated = now(), last = $4,
+               week_start = CASE WHEN $5 THEN now() ELSE week_start END,
+               week = CASE WHEN $5 THEN 1 ELSE floor(extract(epoch FROM now() - week_start) / 604800)::int + 1 END,
+               weeks = jsonb_path_query_array(weeks || jsonb_build_array($4::jsonb), '$[last - $n + 1 to last]',
+                                              jsonb_build_object('n', $6::int)),
                golden_since = CASE WHEN $2 = 'golden' AND status <> 'golden' THEN now()
                                    WHEN $2 = 'golden' THEN golden_since END
              WHERE wallet = $1",
-            &[&wallet, &st, &strikes, &w],
+            &[&wallet, &st, &strikes, &w, &restart, &KEEP],
         )
         .await?;
         done += 1;
@@ -235,20 +252,22 @@ mod tests {
     }
 
     #[test]
-    fn weeks_move_the_status() {
+    fn checks_move_the_status() {
         let ok = Ok(());
         // copies in profit: steady -> golden, lucky -> out
-        assert_eq!(next("trial", 0, &wk(10, 2.0, 500.0), ok), ("golden", 0, "pass"));
-        assert_eq!(next("trial", 0, &wk(10, 2.0, 500.0), Err("one lucky day")), ("rotated", 0, "luck"));
-        // copies in loss, or too few: another week, review, out
-        assert_eq!(next("trial", 0, &wk(10, -1.0, 500.0), ok), ("trial", 1, "fail"));
-        assert_eq!(next("trial", 1, &wk(10, -1.0, -500.0), ok), ("review", 2, "fail"));
-        assert_eq!(next("review", 2, &wk(1, 3.0, 0.0), ok), ("rotated", 3, "idle"));
-        assert_eq!(next("review", 2, &wk(5, 1.0, -10.0), ok), ("golden", 0, "pass"));
-        // golden: one week in loss is tolerated, two send it back
-        assert_eq!(next("golden", 0, &wk(10, -1.0, 500.0), ok), ("golden", 1, "fail"));
-        assert_eq!(next("golden", 1, &wk(10, -1.0, 500.0), ok), ("trial", 0, "fail"));
-        assert_eq!(next("golden", 1, &wk(0, 0.0, 0.0), ok), ("golden", 1, "idle"));
-        assert_eq!(next("golden", 1, &wk(10, 1.0, -5.0), ok), ("golden", 0, "pass"));
+        assert_eq!(next("trial", 7.0, &wk(10, 2.0, 500.0), None, ok), ("golden", 0, "pass"));
+        assert_eq!(next("trial", 9.0, &wk(10, 2.0, 500.0), None, Err("one lucky day")), ("rotated", 0, "luck"));
+        // copies in loss, or too few: on trial to day 14, review to 21, then out
+        assert_eq!(next("trial", 7.0, &wk(10, -1.0, 500.0), None, ok), ("trial", 1, "fail"));
+        assert_eq!(next("trial", 13.9, &wk(1, 3.0, 0.0), None, ok), ("trial", 1, "idle"));
+        assert_eq!(next("trial", 14.0, &wk(10, -1.0, -500.0), None, ok), ("review", 2, "fail"));
+        assert_eq!(next("review", 18.0, &wk(5, 1.0, -10.0), None, ok), ("golden", 0, "pass"));
+        assert_eq!(next("review", 21.0, &wk(1, 3.0, 0.0), None, ok), ("rotated", 3, "idle"));
+        // golden: 7 days in loss are tolerated, 14 send it back
+        let lost = wk(10, -1.0, 500.0);
+        assert_eq!(next("golden", 30.0, &lost, Some(&wk(10, 1.0, 0.0)), ok), ("golden", 1, "fail"));
+        assert_eq!(next("golden", 30.0, &lost, Some(&lost), ok), ("trial", 0, "fail"));
+        assert_eq!(next("golden", 30.0, &wk(0, 0.0, 0.0), Some(&lost), ok), ("golden", 0, "idle"));
+        assert_eq!(next("golden", 30.0, &wk(10, 1.0, -5.0), Some(&lost), ok), ("golden", 0, "pass"));
     }
 }

@@ -34,7 +34,7 @@ pub struct Config {
     pub settle_every_s: u64,
     /// Real orders (live.rs) instead of paper fills, events to their own tables.
     pub live: bool,
-    /// Live: copy the golden list (trial.rs), at most `top_n` wallets, the best of last week
+    /// Live: copy the golden list (trial.rs), at most `top_n` wallets, the best over the last 7 days
     /// first.
     pub top_n: i64,
     /// The live copy pays up to this much a share over the wallet's price.

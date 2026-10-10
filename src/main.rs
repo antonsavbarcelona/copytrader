@@ -10,7 +10,7 @@
 //!
 //! Round one (scout.rs, every 24 h): the big players in the liquid markets and on the
 //! leaderboards go on trial, with their record of success (metric B). Round two (trial.rs):
-//! each is copied on paper against the live order book (engine.rs) and judged week by week;
+//! each is copied on paper against the live order book (engine.rs) and checked daily on its last 7 days;
 //! when its copies earn and its record is steady, it is on the golden list. Events go to DIR/events.jsonl, open lots to
 //! DIR/state.json, and with DATABASE_URL set also to Postgres (see db.rs), which the trials
 //! need and from which a restart takes the state back.
@@ -93,7 +93,7 @@ async fn refresh_top(cfg: &config::Config, url: &str, engine: &engine::Engine, w
     match async { trial::golden(&db::connect(url).await?, cfg.top_n).await }.await {
         Ok(list) => {
             for (w, name, roi) in &list {
-                log!("live: copying {} (golden, copies {:+.1}% last week)", name.as_deref().unwrap_or(w), roi * 100.0);
+                log!("live: copying {} (golden, copies {:+.1}% in the last 7 days)", name.as_deref().unwrap_or(w), roi * 100.0);
             }
             if list.is_empty() {
                 log!("live: the golden list is empty, no new copies");
@@ -315,17 +315,17 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         }
     }
     if let Some(url) = db_url.clone() {
-        // Round two: the weeks that are over are judged, every hour.
+        // Round two: every wallet a week on trial is checked on its last 7 days, every day.
         let (api, crit) = (api.clone(), cfg.scout_criteria.clone());
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(300)).await;
                 match async { trial::evaluate(&db::connect(&url).await?, &api, &crit).await }.await {
                     Ok(0) => {}
-                    Ok(n) => log!("trial: {n} weeks judged"),
+                    Ok(n) => log!("trial: {n} wallets checked on their last 7 days"),
                     Err(e) => log!("trial: evaluation failed: {e}"),
                 }
-                tokio::time::sleep(Duration::from_secs(3300)).await;
+                tokio::time::sleep(Duration::from_secs(86400 - 300)).await;
             }
         });
     }
