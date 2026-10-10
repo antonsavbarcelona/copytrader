@@ -56,6 +56,23 @@ type Wallets = Arc<RwLock<HashSet<String>>>;
 /// leaderboard, and those whose lots are still held.
 async fn refresh_wallets(cfg: &config::Config, api: &api::Api, engine: &engine::Engine, wallets: &RwLock<HashSet<String>>,
     db: Option<&mpsc::UnboundedSender<db::Write>>, db_url: Option<&str>) {
+    if let Some(path) = &cfg.wallets_file {
+        // A fixed list (the backtest's): read again on each refresh, so the file can change.
+        let mut set = match read_wallets(path) {
+            Ok(set) => set,
+            Err(e) => {
+                log!("wallets: {} not read, list kept: {e}", path.display());
+                return;
+            }
+        };
+        let listed = set.len();
+        set.extend(engine.wallets_held().await);
+        let mut w = wallets.write().await;
+        let added = set.difference(&w).count();
+        *w = set;
+        log!("wallets: {} followed ({listed} from {}, {added} new)", w.len(), path.display());
+        return;
+    }
     let mut set: HashSet<String> = HashSet::new();
     if let Some(url) = db_url {
         match async { trial::followed(&db::connect(url).await?).await }.await {
@@ -110,14 +127,37 @@ async fn refresh_top(cfg: &config::Config, url: &str, engine: &engine::Engine, w
     }
 }
 
+/// Wallet addresses from a file: one a line, or the first column of a CSV (a header and
+/// anything not an address are skipped).
+fn read_wallets(path: &std::path::Path) -> anyhow::Result<HashSet<String>> {
+    Ok(std::fs::read_to_string(path)?
+        .lines()
+        .filter_map(|l| l.split(',').next())
+        .map(|w| w.trim().to_lowercase())
+        .filter(|w| w.len() == 42 && w.starts_with("0x"))
+        .collect())
+}
+
 /// One copier's trade feed (stream and REST read-back over its wallets), its engine and its
 /// settlement checks. Returns the tasks whose end must end the run.
 fn spawn_copier(name: &'static str, cfg: &config::Config, api: &api::Api, engine: &Arc<engine::Engine>, wallets: &Wallets)
     -> Vec<(String, JoinHandle<()>)> {
     let (tx, rx) = mpsc::channel(10_000);
+    // The read-back reads every wallet followed, or with --poll-file only those.
+    let polled = match cfg.poll_file.as_deref().map(read_wallets) {
+        Some(Ok(set)) => {
+            log!("{name}: read-back of the {} wallets in the poll file", set.len());
+            Arc::new(RwLock::new(set))
+        }
+        Some(Err(e)) => {
+            log!("{name}: poll file not read, the read-back reads every wallet: {e}");
+            wallets.clone()
+        }
+        None => wallets.clone(),
+    };
     let tasks = vec![
         (format!("{name} stream"), tokio::spawn(stream::run_stream(wallets.clone(), tx.clone()))),
-        (format!("{name} read-back"), tokio::spawn(stream::run_poller(api.clone(), wallets.clone(), tx, cfg.poll_gap_ms))),
+        (format!("{name} read-back"), tokio::spawn(stream::run_poller(api.clone(), polled, tx, cfg.poll_gap_ms))),
         (format!("{name} engine"), tokio::spawn(engine.clone().run(rx))),
     ];
     let engine = engine.clone();

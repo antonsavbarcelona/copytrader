@@ -32,6 +32,11 @@ pub struct Config {
     pub wallets_refresh_s: u64,
     /// How often held outcomes are checked for settlement.
     pub settle_every_s: u64,
+    /// Paper: the wallets to copy from a file (one a line), in place of the trials.
+    pub wallets_file: Option<PathBuf>,
+    /// The REST read-back reads only the wallets in this file (with thousands followed, a round
+    /// of all would take hours; the stream sees every trade anyway).
+    pub poll_file: Option<PathBuf>,
     /// Real orders (live.rs) instead of paper fills, events to their own tables.
     pub live: bool,
     /// Live: copy the golden list (trial.rs), at most `top_n` wallets, the best over the last 7 days
@@ -65,6 +70,8 @@ impl Default for Config {
             poll_gap_ms: 700,
             wallets_refresh_s: 6 * 3600,
             settle_every_s: 300,
+            wallets_file: None,
+            poll_file: None,
             live: false,
             top_n: 10,
             live_cap_abs: 0.03,
@@ -103,6 +110,9 @@ impl Config {
                 "--sell-floor" => c.sell_floor_pct = v()?.parse()?,
                 "--market-gap-h" => c.market_gap_s = v()?.parse::<f64>()? * 3600.0,
                 "--top" => c.top_n = v()?.parse()?,
+                "--wallets-file" => c.wallets_file = Some(PathBuf::from(v()?)),
+                "--poll-file" => c.poll_file = Some(PathBuf::from(v()?)),
+                "--settle-every-s" => c.settle_every_s = v()?.parse()?,
                 "--scout-min-week-trades" => c.scout_criteria.min_week_trades = v()?.parse()?,
                 "--scout-min-pnl" => c.scout_criteria.min_pnl = v()?.parse()?,
                 "--scout-min-age-days" => c.scout_criteria.min_age_days = v()?.parse()?,
