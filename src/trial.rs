@@ -6,11 +6,16 @@
 //! - Copies in profit, on `MIN_BUYS` or more: the copy worked. Then the wallet's record
 //!   (metric B, scout::record, read again now) tells steady from lucky: steady goes on the
 //!   golden list, which the live copy draws from; lucky is dropped (`rotated`).
-//! - Otherwise it stays on trial; 14 days without a check that worked put it up for review
-//!   (`review`: look at what it does), 21 rotate it out (no longer followed).
+//! - A wallet younger than `min_age_days` has too short a record: it is checked from day 14
+//!   on its last 14 days instead, and copies in profit put it on the golden list.
+//! - Otherwise it stays on trial; a week past its first check without one that worked puts it
+//!   up for review (`review`: look at what it does), two weeks rotate it out (no longer
+//!   followed).
 //!
 //! A golden wallet stays on paper and is checked daily as well: its last 7 days in loss and
 //! the 7 before them too send it back to trial (a new one from that day).
+//!
+//! Until the first wallet is golden, the previous version's live picks (`seed`) stand in.
 //!
 //! The state is the `trials` table (db.rs): `week_start` is when the trial started, `week`
 //! the week of it now; the last 60 checks are kept in `weeks`.
@@ -30,7 +35,7 @@ const KEEP: i32 = 60;
 const MIN_BUYS: i64 = 3;
 
 /// Round one's results: every wallet judged goes to `scouted`; those that passed start their
-/// trial. One already copied on paper starts it back to a week ago (or its first copy), so
+/// trial (a seed too). One already copied on paper starts it back to a week ago (or its first copy), so
 /// the copies made count at once.
 pub async fn enroll(c: &Client, judged: &[Judged]) -> Result<usize> {
     let mut new = 0;
@@ -48,7 +53,9 @@ pub async fn enroll(c: &Client, judged: &[Judged]) -> Result<usize> {
                     "INSERT INTO trials (wallet, name, status, week_start, scout)
                      VALUES ($1, $2, 'trial', greatest(now() - interval '7 days',
                        least(now(), (SELECT min(at) FROM events WHERE wallet = $1 AND kind = 'buy'))), $3)
-                     ON CONFLICT (wallet) DO NOTHING",
+                     ON CONFLICT (wallet) DO UPDATE SET status = 'trial', name = EXCLUDED.name,
+                       week_start = EXCLUDED.week_start, scout = EXCLUDED.scout, updated = now()
+                     WHERE trials.status = 'seed'",
                     &[&j.wallet, &j.name, &j.stats],
                 )
                 .await? as usize;
@@ -76,10 +83,11 @@ pub async fn followed(c: &Client) -> Result<Vec<String>> {
 }
 
 /// The golden list, the copies' return over their last 7 days first: (wallet, name, return), up to
-/// `n`.
+/// `n`; while it is empty, the seeds.
 pub async fn golden(c: &Client, n: i64) -> Result<Vec<(String, Option<String>, f64)>> {
     Ok(c.query(
-        "SELECT wallet, name, coalesce((last->>'copy_roi')::float8, 0) AS roi FROM trials WHERE status = 'golden'
+        "SELECT wallet, name, coalesce((last->>'copy_roi')::float8, 0) AS roi FROM trials
+         WHERE status = CASE WHEN EXISTS (SELECT 1 FROM trials WHERE status = 'golden') THEN 'golden' ELSE 'seed' END
          ORDER BY roi DESC LIMIT $1",
         &[&n],
     )
@@ -90,9 +98,9 @@ pub async fn golden(c: &Client, n: i64) -> Result<Vec<(String, Option<String>, f
 }
 
 /// Once, when there are no trials yet: the previous version's live picks (the 10 wallets
-/// whose paper copies opened in the last 3 days did best, on 15+ closed) go on the golden
-/// list as they are, so live copying goes on; from 7 days on they are checked like any golden
-/// wallet. Returns how many.
+/// whose paper copies opened in the last 3 days did best, on 15+ closed) are the `seed`, live
+/// copied while the golden list is empty; those that pass round one start a trial. Returns
+/// how many.
 pub async fn seed_golden(c: &Client) -> Result<u64> {
     Ok(c.execute(
         "WITH k AS (
@@ -114,8 +122,8 @@ pub async fn seed_golden(c: &Client) -> Result<u64> {
            GROUP BY k.wallet, w.name
            HAVING count(*) >= 15 AND sum(back - cost) > 0
            ORDER BY roi DESC LIMIT 10)
-         INSERT INTO trials (wallet, name, status, week_start, golden_since, scout, last)
-         SELECT wallet, name, 'golden', now(), now(), jsonb_build_object('seed', 'live top-10 of the previous version'),
+         INSERT INTO trials (wallet, name, status, week_start, scout, last)
+         SELECT wallet, name, 'seed', now(), jsonb_build_object('seed', 'live top-10 of the previous version'),
                 jsonb_build_object('copy_roi', round(roi::numeric, 3), 'closed', closed, 'seed', true)
          FROM top WHERE NOT EXISTS (SELECT 1 FROM trials)
          ON CONFLICT (wallet) DO NOTHING",
@@ -148,10 +156,10 @@ async fn copies(c: &Client, wallet: &str, from: f64, to: f64) -> Result<Vec<(Str
     Ok(rows.iter().map(|r| (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4))).collect())
 }
 
-/// One week's verdict on the wallet: the copies' profit (open ones at the market's price
-/// now) and the wallet's own.
-async fn week_result(c: &Client, api: &Api, wallet: &str, from: f64) -> Result<Value> {
-    let to = from + WEEK;
+/// The copies' profit over [from, from + len) (open ones at the market's price now) and the
+/// wallet's own.
+async fn week_result(c: &Client, api: &Api, wallet: &str, from: f64, len: f64) -> Result<Value> {
+    let to = from + len;
     let (mut cost, mut pnl, mut open, mut buys) = (0.0, 0.0, 0.0, 0);
     for (token, k, back, left, n) in copies(c, wallet, from, to).await? {
         cost += k;
@@ -206,24 +214,45 @@ fn next(status: &str, days: f64, w: &Value, prev: Option<&Value>, steady: Result
     }
 }
 
-/// Every wallet on trial a week or more (and every golden one) is checked on its last 7 days;
-/// returns how many were checked.
+/// Every wallet on trial a week or more (two when young) and every golden one is checked on
+/// its last 7 days (14 when young); returns how many were checked.
 pub async fn evaluate(c: &Client, api: &Api, crit: &Criteria) -> Result<usize> {
+    // The seeds stand in only until the first wallet is golden.
+    let retired = c
+        .execute(
+            "UPDATE trials SET status = 'rotated', updated = now()
+             WHERE status = 'seed' AND EXISTS (SELECT 1 FROM trials WHERE status = 'golden')",
+            &[],
+        )
+        .await?;
+    if retired > 0 {
+        log!("trial: the golden list has its own wallets, {retired} seeds retired");
+    }
+    // The wallet's age now: at round one, and since.
     let due = c
         .query(
-            "SELECT wallet, name, status, extract(epoch FROM week_start)::float8 FROM trials
-             WHERE status <> 'rotated' AND week_start + interval '7 days' <= now() ORDER BY week_start",
+            "SELECT wallet, name, status, extract(epoch FROM week_start)::float8,
+               coalesce((scout->'record'->>'age_days')::float8, 1e4) + extract(epoch FROM now() - since)::float8 / 86400
+             FROM trials
+             WHERE status IN ('trial', 'review', 'golden') AND week_start + interval '7 days' <= now() ORDER BY week_start",
             &[],
         )
         .await?;
     let mut done = 0;
     for r in due {
-        let (wallet, name, status, start): (String, Option<String>, String, f64) = (r.get(0), r.get(1), r.get(2), r.get(3));
+        let (wallet, name, status, start, age): (String, Option<String>, String, f64, f64) =
+            (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4));
         let t = crate::api::now();
-        let days = (t - start) / 86400.0;
+        let young = status != "golden" && age < crit.min_age_days;
+        let len = if young { 2.0 * WEEK } else { WEEK };
+        if t - start < len {
+            continue;
+        }
+        // A young wallet's first check is a week later: its days count from then.
+        let days = (t - start - (len - WEEK)) / 86400.0;
         let read = async {
-            let w = week_result(c, api, &wallet, t - WEEK).await?;
-            let prev = if status == "golden" { Some(week_result(c, api, &wallet, t - 2.0 * WEEK).await?) } else { None };
+            let w = week_result(c, api, &wallet, t - len, len).await?;
+            let prev = if status == "golden" { Some(week_result(c, api, &wallet, t - 2.0 * WEEK, WEEK).await?) } else { None };
             anyhow::Ok((w, prev))
         };
         let (mut w, prev) = match read.await {
@@ -235,7 +264,7 @@ pub async fn evaluate(c: &Client, api: &Api, crit: &Criteria) -> Result<usize> {
         };
         // The record matters once the copies worked: steady or lucky.
         let mut steady = Ok(());
-        if status != "golden" && copies_worked(&w) == Some(true) {
+        if status != "golden" && !young && copies_worked(&w) == Some(true) {
             match scout::record_of(api, &wallet, crit).await {
                 Ok(b) => {
                     steady = scout::steady(&b, crit);
@@ -251,12 +280,13 @@ pub async fn evaluate(c: &Client, api: &Api, crit: &Criteria) -> Result<usize> {
         if verdict == "luck" {
             w["luck"] = json!(steady.err().unwrap_or(""));
         }
-        w["day"] = json!(days.floor());
+        w["day"] = json!(((t - start) / 86400.0).floor());
+        w["young"] = json!(young);
         w["verdict"] = json!(verdict);
         w["status"] = json!(st);
         if st != status {
-            log!("trial: {} day {:.0} {verdict}: {status} -> {st}, copies {:+.2} on {} buys in 7 days, the wallet {:+.0}",
-                name.as_deref().unwrap_or(&wallet), days.floor(), w["copy_pnl"].as_f64().unwrap_or(0.0), w["buys"],
+            log!("trial: {} day {} {verdict}: {status} -> {st}, copies {:+.2} on {} buys in {} days, the wallet {:+.0}",
+                name.as_deref().unwrap_or(&wallet), w["day"], w["copy_pnl"].as_f64().unwrap_or(0.0), w["buys"], len / 86400.0,
                 w["trader_pnl"].as_f64().unwrap_or(0.0));
         }
         // Back from golden: a new trial from today.

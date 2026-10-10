@@ -104,7 +104,8 @@ impl Config {
                 "--market-gap-h" => c.market_gap_s = v()?.parse::<f64>()? * 3600.0,
                 "--top" => c.top_n = v()?.parse()?,
                 "--scout-min-week-trades" => c.scout_criteria.min_week_trades = v()?.parse()?,
-                "--scout-min-trade" => c.scout_criteria.min_median_trade = v()?.parse()?,
+                "--scout-min-pnl" => c.scout_criteria.min_pnl = v()?.parse()?,
+                "--scout-min-age-days" => c.scout_criteria.min_age_days = v()?.parse()?,
                 other => anyhow::bail!("unknown option {other}"),
             }
             i += 2;

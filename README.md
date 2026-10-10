@@ -42,14 +42,15 @@ DATABASE_URL=postgresql://... target/release/copytrader report
 Every 24 h (the first 2 min after the start) the run gathers candidates: the 50 biggest
 holders of each outcome and the wallets of the last 1000 trades of $100+ in the ~400 markets
 traded most over the last day (books of $10k+), and the top 500 of Polymarket's leaderboards
-(every category, month and all-time). Round one only leaves out the small ones: a wallet
-passes when its median trade (last 500) is $200 or more (`--scout-min-trade`) and it traded
-5+ times in the last week (`--scout-min-week-trades`; a week on paper needs trades).
+(every category, month and all-time). A wallet passes when it trades often, 20+ trades in
+the last week (`--scout-min-week-trades`), and made real money: $50k+ over the last 4
+months (`--scout-min-pnl`), from the profit history behind its profile chart. Trade sizes
+are not judged: an active trader's buy is often dozens of small fills.
 
-Each that passes also gets its record, **metric B**, from the profit history behind its
-profile chart: age, profit over the last 4 months and each month's, months and weeks up,
-the longest runs of months and weeks up, the current run of weeks up, its best day. B decides
-nothing in round one; it is kept for analysis and read again after a profitable week.
+Each that passes also gets its record, **metric B**, from the same history: age, profit
+over the last 4 months and each month's, months and weeks up, the longest runs of months and
+weeks up, the current run of weeks up, its best day. B decides nothing in round one; it is
+read again after a profitable week on paper.
 
 Every wallet judged goes to `scouted` (with why it failed), and is judged again after 7
 days. `copytrader scout` runs round one now and prints the verdicts without saving anything.
@@ -65,16 +66,19 @@ now); its own profit in them is kept next to them.
 - Copies in profit on 3+ copies: B, read again, tells steady from lucky. **Steady** (traded
   120+ days; 3 of the last 4 months up and the 4 months in profit; 60%+ of their weeks up;
   best day under half the profit) goes on the **golden list**; **lucky** is dropped.
-- Otherwise it stays on trial; from day 14 without such a check it is `review` (look at what
-  it trades), from day 21 `rotated` and no longer followed.
+- A wallet younger than 4 months (`--scout-min-age-days 120`) has too short a record: it is
+  checked from day 14 on its last 14 days instead, and copies in profit put it on the
+  golden list.
+- Otherwise it stays on trial; a week past its first check without one that worked it is
+  `review` (look at what it trades), two weeks past it `rotated` and no longer followed.
 
 Golden wallets stay on paper and are checked daily too: their last 7 days of copies in loss
 and the 7 before them as well send one back to a new trial. The last 60 checks (and B when
 read) are kept in `trials.weeks`.
 
 On the first start with trials, the previous version's live top-10 (best paper copies of
-the last 3 days) is put on the golden list as it is, so live copying goes on; from day 7
-those wallets are checked like any golden one.
+the last 3 days) is saved as the `seed`: live copies it while the golden list is empty, and
+it is retired once a wallet is golden. Those of it that pass round one start a trial.
 
 ## Live (real orders)
 

@@ -9,7 +9,8 @@
 //!     copytrader scout                     (round one now: who passes; read only)
 //!
 //! Round one (scout.rs, every 24 h): the big players in the liquid markets and on the
-//! leaderboards go on trial, with their record of success (metric B). Round two (trial.rs):
+//! leaderboards that trade often and made $50k+ in 4 months go on trial, with their record
+//! of success (metric B). Round two (trial.rs):
 //! each is copied on paper against the live order book (engine.rs) and checked daily on its last 7 days;
 //! when its copies earn and its record is steady, it is on the golden list. Events go to DIR/events.jsonl, open lots to
 //! DIR/state.json, and with DATABASE_URL set also to Postgres (see db.rs), which the trials
@@ -93,7 +94,7 @@ async fn refresh_top(cfg: &config::Config, url: &str, engine: &engine::Engine, w
     match async { trial::golden(&db::connect(url).await?, cfg.top_n).await }.await {
         Ok(list) => {
             for (w, name, roi) in &list {
-                log!("live: copying {} (golden, copies {:+.1}% in the last 7 days)", name.as_deref().unwrap_or(w), roi * 100.0);
+                log!("live: copying {} (copies {:+.1}% in their last check)", name.as_deref().unwrap_or(w), roi * 100.0);
             }
             if list.is_empty() {
                 log!("live: the golden list is empty, no new copies");
@@ -257,11 +258,11 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     };
 
     if let Some(url) = &db_url {
-        // The first start with trials: the previous version's live top-10 is the golden list
-        // until the trials have one of their own.
+        // The first start with trials: the previous version's live top-10 stands in for the
+        // golden list until the trials have one of their own.
         match async { trial::seed_golden(&db::connect(url).await?).await }.await {
             Ok(0) => {}
-            Ok(n) => log!("trial: the previous live top-{n} starts as the golden list"),
+            Ok(n) => log!("trial: the previous live top-{n} stands in until the golden list has a wallet"),
             Err(e) => log!("trial: golden seed failed: {e}"),
         }
     }

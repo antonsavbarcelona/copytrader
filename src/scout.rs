@@ -1,14 +1,15 @@
 //! Round one: the big players. The candidates are the wallets in the liquid markets (the
 //! biggest holders and the large trades of the markets traded most over the last day) and
-//! those on Polymarket's leaderboards (every category, month and all-time). Round one only
-//! leaves out the small ones: a wallet passes when its median trade (its last 500) is
-//! `min_median_trade` dollars or more and it traded `min_week_trades` times in the last week
-//! (a week on paper needs trades to judge).
+//! those on Polymarket's leaderboards (every category, month and all-time). A wallet passes
+//! when it trades often (`min_week_trades` trades in the last week, of its last 500) and has
+//! made real money: `min_pnl` dollars over the last `months` months, from the profit history
+//! behind its profile chart. (Trade sizes do not tell: an active trader's buy is often dozens
+//! of small fills.)
 //!
-//! Each that passes is also given its record (`record`, metric B): how often and for how long
-//! it has made money, from the profit history behind its profile chart. The record decides
-//! nothing here; after a profitable week on paper it tells a steady trader (`steady`: golden)
-//! from a lucky one (dropped), see trial.rs.
+//! That history also gives its record (`record`, metric B): how often and for how long it has
+//! made money. After a profitable week on paper the record tells a steady trader (`steady`:
+//! golden) from a lucky one (dropped); a wallet younger than `min_age_days` has too short a
+//! record and gets two weeks on paper instead, see trial.rs.
 
 use std::collections::{HashMap, HashSet};
 
@@ -26,9 +27,10 @@ const CATEGORIES: [&str; 9] =
 #[derive(Clone, Debug)]
 pub struct Criteria {
     /// Round one: a big player.
-    pub min_median_trade: f64,
     pub min_week_trades: usize,
-    /// Steady (after the week on paper): trading for `min_age_days`, in profit in
+    pub min_pnl: f64,
+    /// Steady (after the week on paper): trading for `min_age_days` (younger: two weeks on
+    /// paper instead of the record), in profit in
     /// `min_months_up` of the last `months` months (30 days each) and over them, in a
     /// `min_weeks_up` share of their weeks, its best day under `max_best_day` of the profit.
     pub min_age_days: f64,
@@ -41,8 +43,8 @@ pub struct Criteria {
 impl Default for Criteria {
     fn default() -> Self {
         Self {
-            min_median_trade: 200.0,
-            min_week_trades: 5,
+            min_week_trades: 20,
+            min_pnl: 50_000.0,
             min_age_days: 120.0,
             months: 4,
             min_months_up: 3,
@@ -174,7 +176,7 @@ async fn candidates(api: &Api) -> HashMap<String, Option<String>> {
     out
 }
 
-/// One wallet: its trades (big and active?), then the record of those that are.
+/// One wallet: its trades (active?), then the profit and record of those that are.
 async fn judge(api: Api, c: Criteria, wallet: String, name: Option<String>) -> Option<Judged> {
     let trades = match api.trade_sizes(&wallet, 500).await {
         Ok(t) => t,
@@ -185,23 +187,23 @@ async fn judge(api: Api, c: Criteria, wallet: String, name: Option<String>) -> O
     };
     let week = trades.iter().filter(|(ts, _)| now() - ts < 7.0 * DAY).count();
     let m = median(trades.iter().map(|(_, usd)| *usd).collect());
-    let why = if m < c.min_median_trade {
-        "small trades"
-    } else if week < c.min_week_trades {
-        "few trades this week"
-    } else {
-        ""
-    };
-    let mut stats = json!({"median_trade": m.round(), "week_trades": week, "why": why});
+    let mut why = if week < c.min_week_trades { "few trades this week" } else { "" };
+    let mut stats = json!({"median_trade": m.round(), "week_trades": week});
     if why.is_empty() {
         match record_of(&api, &wallet, &c).await {
-            Ok(b) => stats["record"] = b,
+            Ok(b) => {
+                if b["pnl"].as_f64().unwrap_or(0.0) < c.min_pnl {
+                    why = "small profit";
+                }
+                stats["record"] = b;
+            }
             Err(e) => {
                 log!("scout: {wallet} history read failed: {e}");
                 return None;
             }
         }
     }
+    stats["why"] = json!(why);
     Some(Judged { wallet, name, ok: why.is_empty(), stats })
 }
 
@@ -211,8 +213,8 @@ async fn judge(api: Api, c: Criteria, wallet: String, name: Option<String>) -> O
 pub async fn scan(api: &Api, c: &Criteria, skip: &HashSet<String>, out: &mpsc::UnboundedSender<Judged>) -> (usize, usize) {
     let cands: Vec<(String, Option<String>)> = candidates(api).await.into_iter().filter(|(w, _)| !skip.contains(w)).collect();
     log!("scout: judging {} wallets", cands.len());
-    // The data API answers in ~0.1 s; the profit history (big players only) takes seconds.
-    let mut judged = futures_util::stream::iter(cands.into_iter().map(|(w, n)| judge(api.clone(), c.clone(), w, n))).buffer_unordered(8);
+    // The data API answers in ~0.1 s; the profit history (active wallets only) takes seconds.
+    let mut judged = futures_util::stream::iter(cands.into_iter().map(|(w, n)| judge(api.clone(), c.clone(), w, n))).buffer_unordered(16);
     let (mut n, mut ok) = (0, 0);
     while let Some(j) = judged.next().await {
         if let Some(j) = j {
