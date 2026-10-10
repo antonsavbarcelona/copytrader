@@ -42,6 +42,14 @@ pub struct Config {
     pub top_min_closed: i64,
     /// The live copy pays up to this much a share over the wallet's price.
     pub live_cap_abs: f64,
+    /// Look for traders in the short crypto markets and paper-copy them (discover.rs).
+    pub discover: bool,
+    pub discover_every_s: u64,
+    pub discover_criteria: crate::discover::Criteria,
+    /// The golden list (the live copy's pool): followed on paper `golden_days` at least, with
+    /// `golden_min_closed` closed copies in the last `golden_days` and a profit on them.
+    pub golden_days: f64,
+    pub golden_min_closed: i64,
 }
 
 impl Default for Config {
@@ -65,6 +73,19 @@ impl Default for Config {
             top_days: 3.0,
             top_min_closed: 15,
             live_cap_abs: 0.03,
+            discover: true,
+            discover_every_s: 6 * 3600,
+            // Everyone trading these markets gets the week on paper: the copies decide, not
+            // the wallet's own record (the other thresholds are off).
+            discover_criteria: crate::discover::Criteria {
+                min_positions: 10,
+                min_pnl: f64::NEG_INFINITY,
+                min_roi: f64::NEG_INFINITY,
+                min_week_share: 0.0,
+                max_per_day: f64::INFINITY,
+            },
+            golden_days: 7.0,
+            golden_min_closed: 30,
         }
     }
 }
@@ -82,6 +103,11 @@ impl Config {
                 i += 1;
                 continue;
             }
+            if args[i] == "--no-discover" {
+                c.discover = false;
+                i += 1;
+                continue;
+            }
             match args[i].as_str() {
                 "--data" => c.data_dir = PathBuf::from(v()?),
                 "--stake" => c.stake_usd = v()?.parse()?,
@@ -92,6 +118,9 @@ impl Config {
                 "--top" => c.top_n = v()?.parse()?,
                 "--top-days" => c.top_days = v()?.parse()?,
                 "--top-min-closed" => c.top_min_closed = v()?.parse()?,
+                "--golden-days" => c.golden_days = v()?.parse()?,
+                "--golden-min-closed" => c.golden_min_closed = v()?.parse()?,
+                "--discover-min-pnl" => c.discover_criteria.min_pnl = v()?.parse()?,
                 other => anyhow::bail!("unknown option {other}"),
             }
             i += 2;

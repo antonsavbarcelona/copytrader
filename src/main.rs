@@ -5,27 +5,33 @@
 //!     copytrader report [--data DIR] [--hours 24] [--live]
 //!     copytrader check                     (the live keys: account and cash, no order)
 //!     copytrader test-trade TOKEN [USD]    (a real buy of USD, default 1, then its sale)
+//!     copytrader discover                  (who a crypto-market scan would add; read only)
 //!
 //! `run` follows every wallet on the Polyfox leaderboard (read again every 6 h) and copies
 //! their buys and sales on paper against the live order book; see engine.rs for the rules.
 //! Events go to DIR/events.jsonl, open lots to DIR/state.json, and with DATABASE_URL set
 //! also to Postgres (see db.rs), from which a restart takes the state back.
 //!
+//! Traders of the short crypto markets (Up or Down) found on Polymarket's crypto leaderboard
+//! join the paper copy too (discover.rs; --no-discover leaves them out). After a week on paper,
+//! a wallet whose copies earned is on the golden list (`golden` table).
+//!
 //! With the live keys in the environment (live.rs) and DATABASE_URL set, the same process
-//! also copies for real: only the `--top` wallets whose paper copies did best over the last
+//! also copies for real: the `--top` golden wallets whose paper copies did best over the last
 //! `--top-days`, with their own trade stream and read-back, events in `live_events` and
 //! DIR/live. LIVE=off leaves the keys unused.
 
 mod api;
 mod config;
 mod db;
+mod discover;
 mod engine;
 mod fill;
 mod live;
 mod report;
 mod stream;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -46,8 +52,17 @@ const NO_TRADES_EXIT_S: u64 = 30 * 60;
 
 type Wallets = Arc<RwLock<HashSet<String>>>;
 
+/// The paper copy's wallets: the Polyfox leaderboard, the crypto traders found so far (from
+/// the database) and those whose lots are still held.
 async fn refresh_wallets(api: &api::Api, engine: &engine::Engine, wallets: &RwLock<HashSet<String>>,
-    path: &std::path::Path, db: Option<&mpsc::UnboundedSender<db::Write>>) {
+    path: &std::path::Path, db: Option<&mpsc::UnboundedSender<db::Write>>, db_url: Option<&str>) {
+    let crypto = match db_url {
+        Some(url) => match db::connect(url).await {
+            Ok(c) => db::crypto_wallets(&c).await.unwrap_or_default(),
+            Err(_) => Vec::new(),
+        },
+        None => Vec::new(),
+    };
     match api.polyfox_wallets().await {
         Ok(list) => {
             if let Some(db) = db {
@@ -57,12 +72,13 @@ async fn refresh_wallets(api: &api::Api, engine: &engine::Engine, wallets: &RwLo
             let rows: Vec<serde_json::Value> =
                 list.iter().map(|w| serde_json::json!({"wallet": w.address, "name": w.name})).collect();
             let _ = std::fs::write(path, serde_json::to_string_pretty(&rows).unwrap_or_default());
+            set.extend(crypto.iter().cloned());
             // Wallets that left the leaderboard are still followed while we hold their lots.
             set.extend(engine.wallets_held().await);
             let mut w = wallets.write().await;
             let added = set.difference(&w).count();
             *w = set;
-            log!("wallets: {} followed ({added} new)", w.len());
+            log!("wallets: {} followed ({} found in the crypto markets, {added} new)", w.len(), crypto.len());
         }
         Err(e) => log!("wallets: Polyfox read failed: {e}"),
     }
@@ -71,7 +87,15 @@ async fn refresh_wallets(api: &api::Api, engine: &engine::Engine, wallets: &RwLo
 /// Live: the wallets to copy, the best of the paper copies lately.
 async fn refresh_top(cfg: &config::Config, url: &str, engine: &engine::Engine, wallets: &RwLock<HashSet<String>>) {
     let top = match db::connect(url).await {
-        Ok(c) => db::top_wallets(&c, cfg.top_days, cfg.top_min_closed, cfg.top_n).await,
+        Ok(c) => match db::golden_wallets(&c, cfg.golden_days, cfg.golden_min_closed).await {
+            Ok(golden) => {
+                log!("golden list: {} wallets ({} days on paper, {}+ closed copies, in profit)", golden.len(),
+                    cfg.golden_days, cfg.golden_min_closed);
+                let among: Vec<String> = golden.into_iter().map(|(w, ..)| w).collect();
+                db::top_wallets(&c, cfg.top_days, cfg.top_min_closed, cfg.top_n, &among).await
+            }
+            Err(e) => Err(e),
+        },
         Err(e) => Err(e),
     };
     match top {
@@ -132,6 +156,15 @@ async fn main() -> anyhow::Result<()> {
         println!("signer {}\nproxy wallet {}\ncash ${:.2}", l.signer_address(), l.funder, l.cash().await?);
         return Ok(());
     }
+    if cmd == "discover" {
+        // Who a scan of the crypto markets would add to the paper copy now; nothing is saved.
+        let cfg = config::Config::default();
+        let found = discover::scan(&api::Api::new()?, &cfg.discover_criteria, &HashSet::new(), &mut HashMap::new()).await;
+        for f in &found {
+            println!("{} {} {}", f.wallet, f.name.as_deref().unwrap_or("-"), f.stats);
+        }
+        return Ok(());
+    }
     if cmd == "order" {
         // An order's state as the exchange reports it; read only.
         let l = live::Live::connect().await?;
@@ -151,7 +184,7 @@ async fn main() -> anyhow::Result<()> {
         let mut e = Vec::new();
         let mut i = 0;
         while i < rest.len() {
-            if rest[i] == "--live" {
+            if rest[i] == "--live" || rest[i] == "--no-discover" {
                 c.push(rest[i].clone());
                 i += 1;
                 continue;
@@ -221,18 +254,39 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     let paper = engine::Engine::open(cfg.clone(), api.clone(), db_tx.clone(), paper_state, None)?;
     let paper_wallets: Wallets = Arc::new(RwLock::new(HashSet::new()));
     let wallets_path = cfg.data_dir.join("wallets.json");
-    refresh_wallets(&api, &paper, &paper_wallets, &wallets_path, db_tx.as_ref()).await;
+    refresh_wallets(&api, &paper, &paper_wallets, &wallets_path, db_tx.as_ref(), db_url.as_deref()).await;
     if paper_wallets.read().await.is_empty() {
         anyhow::bail!("no wallets to follow (Polyfox read failed)");
     }
     let mut tasks = spawn_copier("paper", &cfg, &api, &paper, &paper_wallets);
     {
-        let (api, engine, wallets, db_tx) = (api.clone(), paper.clone(), paper_wallets.clone(), db_tx.clone());
+        let (api, engine, wallets, db_tx, url) = (api.clone(), paper.clone(), paper_wallets.clone(), db_tx.clone(), db_url.clone());
         let every = cfg.wallets_refresh_s;
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(every)).await;
-                refresh_wallets(&api, &engine, &wallets, &wallets_path, db_tx.as_ref()).await;
+                refresh_wallets(&api, &engine, &wallets, &wallets_path, db_tx.as_ref(), url.as_deref()).await;
+            }
+        });
+    }
+    if let (true, Some(db)) = (cfg.discover, db_tx.clone()) {
+        // Traders found in the crypto markets join the paper copy at once and stay in it
+        // (saved in `wallets`, read back on every refresh).
+        let (api, wallets, cfg) = (api.clone(), paper_wallets.clone(), cfg.clone());
+        tokio::spawn(async move {
+            let mut judged: HashMap<String, f64> = HashMap::new();
+            // Not in the start's rush of requests.
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            loop {
+                let known = wallets.read().await.clone();
+                let found = discover::scan(&api, &cfg.discover_criteria, &known, &mut judged).await;
+                if !found.is_empty() {
+                    let _ = db.send(db::Write::Discovered(found.iter().map(|f| (f.wallet.clone(), f.name.clone(), f.stats.clone())).collect()));
+                    let mut w = wallets.write().await;
+                    w.extend(found.into_iter().map(|f| f.wallet));
+                    log!("wallets: {} followed", w.len());
+                }
+                tokio::time::sleep(Duration::from_secs(cfg.discover_every_s)).await;
             }
         });
     }

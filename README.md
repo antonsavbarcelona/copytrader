@@ -36,6 +36,19 @@ Report on the server's data from anywhere, with the database's public URL:
 DATABASE_URL=postgresql://... target/release/copytrader report
 ```
 
+## Crypto traders and the golden list
+
+Every 6 h the run also reads Polymarket's crypto leaderboard (week and month, top 100) and
+adds to the paper copy every wallet with 10+ closed positions in the short crypto markets
+("Bitcoin Up or Down", ETH, SOL, XRP ...): no other filter, bots included. They are saved in
+`wallets` (`source = 'crypto'`, their own record in `stats`) and followed from then on.
+`copytrader discover` shows who a scan would add, without saving anything.
+
+The golden list (`golden` table, `active`) is the wallets followed on paper for 7 days or more
+whose copies of the last 7 days closed 30+ times in profit (`--golden-days`,
+`--golden-min-closed`); Polyfox wallets go by the same rule. The live copy picks its wallets
+from it only.
+
 ## Live (real orders)
 
 The same service also copies for real once the account's keys are in its variables (next to
@@ -52,7 +65,7 @@ The log says `live: ON, signer .. proxy wallet .. cash $..` at the start (or why
 the paper copy runs either way). `copytrader check` shows the account and cash without an
 order, `copytrader test-trade TOKEN [USD]` makes a real buy and sells it back.
 
-Live copies only the `--top` (10) wallets whose paper copies returned the most over the last
+Live copies only the `--top` (10) golden wallets whose paper copies returned the most over the last
 `--top-days` (3; closed positions, at least `--top-min-closed` 15, positive), picked again
 every 6 h, with its own trade stream and read-back (a 10-wallet round takes seconds);
 wallets whose lots it holds stay followed for their sales. Buys are FAK market orders capped

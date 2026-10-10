@@ -121,7 +121,9 @@ impl Engine {
             seen: Mutex::new((HashSet::new(), VecDeque::new())),
             pending: Mutex::new(HashMap::new()),
             rechecks: Mutex::new(HashSet::new()),
-            limit: Semaphore::new(16),
+            // Bots trading the 5-minute crypto markets come in bursts: room for them, so a copy
+            // is not late for waiting its turn.
+            limit: Semaphore::new(64),
             db,
             started: now(),
             live,

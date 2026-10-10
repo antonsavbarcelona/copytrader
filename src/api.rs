@@ -262,6 +262,52 @@ impl Api {
         Ok(out)
     }
 
+    /// Polymarket's crypto leaderboard by profit over `period` (DAY, WEEK, MONTH, ALL): the
+    /// first `n` wallets.
+    pub async fn crypto_leaders(&self, period: &str, n: usize) -> Result<Vec<WalletInfo>> {
+        let mut out = Vec::new();
+        let mut off = 0;
+        while out.len() < n {
+            let v = self
+                .get(&format!("{DATA}/v1/leaderboard?category=CRYPTO&timePeriod={period}&orderBy=PNL&limit=50&offset={off}"))
+                .await?;
+            let rows = v.as_array().cloned().unwrap_or_default();
+            for r in &rows {
+                out.push(WalletInfo {
+                    address: s(&r["proxyWallet"]).to_lowercase(),
+                    name: r["userName"].as_str().filter(|n| !n.is_empty()).map(str::to_string),
+                });
+            }
+            if rows.len() < 50 {
+                break;
+            }
+            off += 50;
+        }
+        out.truncate(n);
+        Ok(out)
+    }
+
+    /// The wallet's closed positions, newest first, up to `max`.
+    pub async fn closed_positions(&self, wallet: &str, max: usize) -> Result<Vec<Value>> {
+        let mut out = Vec::new();
+        while out.len() < max {
+            let v = self
+                .get(&format!(
+                    "{DATA}/closed-positions?user={wallet}&limit=50&offset={}&sortBy=TIMESTAMP&sortDirection=DESC",
+                    out.len()
+                ))
+                .await?;
+            let rows = v.as_array().cloned().unwrap_or_default();
+            let n = rows.len();
+            out.extend(rows);
+            if n < 50 {
+                break;
+            }
+        }
+        out.truncate(max);
+        Ok(out)
+    }
+
     /// Every wallet on the Polyfox smart-wallet leaderboard.
     pub async fn polyfox_wallets(&self) -> Result<Vec<WalletInfo>> {
         let mut out = Vec::new();
