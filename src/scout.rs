@@ -1,17 +1,14 @@
-//! Round one: finding traders whose profit is a pattern, not luck. The candidates are the
-//! wallets in the liquid markets (the biggest holders and the large trades of the markets
-//! traded most over the last day) and those on Polymarket's leaderboards (every category,
-//! month and all-time). Each is judged on the profit history behind its profile chart:
+//! Round one: the big players. The candidates are the wallets in the liquid markets (the
+//! biggest holders and the large trades of the markets traded most over the last day) and
+//! those on Polymarket's leaderboards (every category, month and all-time). Round one only
+//! leaves out the small ones: a wallet passes when its median trade (its last 500) is
+//! `min_median_trade` dollars or more and it traded `min_week_trades` times in the last week
+//! (a week on paper needs trades to judge).
 //!
-//! - trading for `min_age_days` at least, and lately (the history goes on to this week);
-//! - in profit in `min_months_up` of the last `months` months (30 days each), with
-//!   `min_pnl` dollars or more over them;
-//! - in profit in a `min_weeks_up` share of the weeks of those months;
-//! - not made in one stroke: its best day is under `max_best_day` of the profit;
-//! - with a real deposit: its median trade (the last 500) is `min_median_trade` dollars or
-//!   more.
-//!
-//! Those that pass go on to the week on paper (trial.rs).
+//! Each that passes is also given its record (`record`, metric B): how often and for how long
+//! it has made money, from the profit history behind its profile chart. The record decides
+//! nothing here; after a profitable week on paper it tells a steady trader (`steady`: golden)
+//! from a lucky one (dropped), see trial.rs.
 
 use std::collections::{HashMap, HashSet};
 
@@ -28,25 +25,29 @@ const CATEGORIES: [&str; 9] =
 
 #[derive(Clone, Debug)]
 pub struct Criteria {
+    /// Round one: a big player.
+    pub min_median_trade: f64,
+    pub min_week_trades: usize,
+    /// Steady (after the week on paper): trading for `min_age_days`, in profit in
+    /// `min_months_up` of the last `months` months (30 days each) and over them, in a
+    /// `min_weeks_up` share of their weeks, its best day under `max_best_day` of the profit.
     pub min_age_days: f64,
     pub months: usize,
     pub min_months_up: usize,
-    pub min_pnl: f64,
     pub min_weeks_up: f64,
     pub max_best_day: f64,
-    pub min_median_trade: f64,
 }
 
 impl Default for Criteria {
     fn default() -> Self {
         Self {
+            min_median_trade: 200.0,
+            min_week_trades: 5,
             min_age_days: 120.0,
             months: 4,
             min_months_up: 3,
-            min_pnl: 5000.0,
             min_weeks_up: 0.6,
             max_best_day: 0.5,
-            min_median_trade: 50.0,
         }
     }
 }
@@ -66,43 +67,66 @@ pub fn at(h: &[(f64, f64)], t: f64) -> f64 {
     }
 }
 
-/// The profit history's verdict (the deposit is checked apart), and the record.
-fn judge_history(h: &[(f64, f64)], t: f64, c: &Criteria) -> (bool, Value) {
+/// The longest run of `true`, oldest to newest or the other way.
+fn longest(v: &[bool]) -> usize {
+    v.split(|x| !x).map(<[bool]>::len).max().unwrap_or(0)
+}
+
+/// Metric B, the wallet's record of success from its profit history (`h`, daily): its age, its
+/// profit over the last `months` months, each month's and how many were up, the share of
+/// weeks up, the longest runs of months and weeks up (newest first), the current run of weeks
+/// up, and its best day.
+pub fn record(h: &[(f64, f64)], t: f64, c: &Criteria) -> Value {
     let (Some(first), Some(last)) = (h.first(), h.last()) else {
-        return (false, json!({"why": "no history"}));
+        return json!({"age_days": 0});
     };
-    let age = (t - first.0) / DAY;
     let end = last.0;
     let span = c.months as f64 * 30.0 * DAY;
     let window = |len: f64, k: usize| at(h, end - len * k as f64) - at(h, end - len * (k + 1) as f64);
     let months: Vec<f64> = (0..c.months).map(|k| window(30.0 * DAY, k)).collect();
     let weeks: Vec<f64> = (0..(c.months * 30 / 7)).map(|k| window(7.0 * DAY, k)).collect();
+    // The whole history in months, for the longest run.
+    let all_months: Vec<bool> = (0..((end - first.0) / (30.0 * DAY)) as usize).map(|k| window(30.0 * DAY, k) > 0.0).collect();
+    let weeks_up: Vec<bool> = weeks.iter().map(|w| *w > 0.0).collect();
     let pnl = at(h, end) - at(h, end - span);
     let best_day = h.windows(2).filter(|w| w[1].0 > end - span).map(|w| w[1].1 - w[0].1).fold(0.0, f64::max);
-    let months_up = months.iter().filter(|m| **m > 0.0).count();
-    let weeks_up = weeks.iter().filter(|w| **w > 0.0).count() as f64 / weeks.len().max(1) as f64;
-    let why = if age < c.min_age_days {
-        "too new"
-    } else if t - end > 7.0 * DAY {
-        "not trading lately"
-    } else if months_up < c.min_months_up {
-        "months in loss"
-    } else if pnl < c.min_pnl {
-        "profit too small"
-    } else if weeks_up < c.min_weeks_up {
-        "weeks in loss"
-    } else if best_day > c.max_best_day * pnl {
-        "one lucky day"
-    } else {
-        ""
-    };
     let r = |x: f64| x.round();
-    let stats = json!({
-        "age_days": r(age), "pnl": r(pnl), "months": months.iter().map(|m| r(*m)).collect::<Vec<_>>(),
-        "months_up": months_up, "weeks_up": (weeks_up * 100.0).round() / 100.0, "best_day": r(best_day),
-        "why": why,
-    });
-    (why.is_empty(), stats)
+    json!({
+        "age_days": r((t - first.0) / DAY), "idle_days": r((t - end) / DAY), "pnl": r(pnl),
+        "months": months.iter().map(|m| r(*m)).collect::<Vec<_>>(),
+        "months_up": months.iter().filter(|m| **m > 0.0).count(),
+        "longest_months_up": longest(&all_months),
+        "weeks_up": (weeks_up.iter().filter(|w| **w).count() as f64 / weeks.len().max(1) as f64 * 100.0).round() / 100.0,
+        "longest_weeks_up": longest(&weeks_up),
+        "weeks_up_now": weeks_up.iter().take_while(|w| **w).count(),
+        "best_day": r(best_day), "all_time": r(last.1),
+    })
+}
+
+/// Whether the record is a steady trader's; if not, why.
+pub fn steady(b: &Value, c: &Criteria) -> Result<(), &'static str> {
+    let f = |k: &str| b[k].as_f64().unwrap_or(0.0);
+    if f("age_days") < c.min_age_days {
+        Err("too new")
+    } else if (f("months_up") as usize) < c.min_months_up {
+        Err("months in loss")
+    } else if f("pnl") <= 0.0 {
+        Err("in loss")
+    } else if f("weeks_up") < c.min_weeks_up {
+        Err("weeks in loss")
+    } else if f("best_day") > c.max_best_day * f("pnl") {
+        Err("one lucky day")
+    } else {
+        Ok(())
+    }
+}
+
+/// The wallet's record now, from its profit history.
+pub async fn record_of(api: &Api, wallet: &str, c: &Criteria) -> anyhow::Result<Value> {
+    let h = api.pnl_history(wallet, "all", "1d").await?;
+    let mut b = record(&h, now(), c);
+    b["steady"] = json!(steady(&b, c).err().unwrap_or(""));
+    Ok(b)
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -150,26 +174,35 @@ async fn candidates(api: &Api) -> HashMap<String, Option<String>> {
     out
 }
 
-/// One wallet: its history, then (if that passes) its trade sizes.
+/// One wallet: its trades (big and active?), then the record of those that are.
 async fn judge(api: Api, c: Criteria, wallet: String, name: Option<String>) -> Option<Judged> {
-    let h = match api.pnl_history(&wallet, "all", "1d").await {
-        Ok(h) => h,
+    let trades = match api.trade_sizes(&wallet, 500).await {
+        Ok(t) => t,
         Err(e) => {
-            log!("scout: {wallet} history read failed: {e}");
+            log!("scout: {wallet} trades read failed: {e}");
             return None;
         }
     };
-    let (mut ok, mut stats) = judge_history(&h, now(), &c);
-    if ok {
-        let sizes = api.trade_sizes(&wallet, 500).await.ok()?;
-        let m = median(sizes);
-        stats["median_trade"] = json!(m.round());
-        if m < c.min_median_trade {
-            ok = false;
-            stats["why"] = json!("small trades");
+    let week = trades.iter().filter(|(ts, _)| now() - ts < 7.0 * DAY).count();
+    let m = median(trades.iter().map(|(_, usd)| *usd).collect());
+    let why = if m < c.min_median_trade {
+        "small trades"
+    } else if week < c.min_week_trades {
+        "few trades this week"
+    } else {
+        ""
+    };
+    let mut stats = json!({"median_trade": m.round(), "week_trades": week, "why": why});
+    if why.is_empty() {
+        match record_of(&api, &wallet, &c).await {
+            Ok(b) => stats["record"] = b,
+            Err(e) => {
+                log!("scout: {wallet} history read failed: {e}");
+                return None;
+            }
         }
     }
-    Some(Judged { wallet, name, ok, stats })
+    Some(Judged { wallet, name, ok: why.is_empty(), stats })
 }
 
 /// One scan: every candidate not in `skip` (on trial already, or judged lately) is judged,
@@ -178,9 +211,8 @@ async fn judge(api: Api, c: Criteria, wallet: String, name: Option<String>) -> O
 pub async fn scan(api: &Api, c: &Criteria, skip: &HashSet<String>, out: &mpsc::UnboundedSender<Judged>) -> (usize, usize) {
     let cands: Vec<(String, Option<String>)> = candidates(api).await.into_iter().filter(|(w, _)| !skip.contains(w)).collect();
     log!("scout: judging {} wallets", cands.len());
-    // The profit history API takes seconds over an active wallet and allows ~20 requests a
-    // second: 24 at a time keep it busy without hitting that.
-    let mut judged = futures_util::stream::iter(cands.into_iter().map(|(w, n)| judge(api.clone(), c.clone(), w, n))).buffer_unordered(24);
+    // The data API answers in ~0.1 s; the profit history (big players only) takes seconds.
+    let mut judged = futures_util::stream::iter(cands.into_iter().map(|(w, n)| judge(api.clone(), c.clone(), w, n))).buffer_unordered(8);
     let (mut n, mut ok) = (0, 0);
     while let Some(j) = judged.next().await {
         if let Some(j) = j {
@@ -214,24 +246,22 @@ mod tests {
             .collect()
     }
 
+    fn steady_of(h: &[(f64, f64)], t: f64) -> Result<(), &'static str> {
+        steady(&record(h, t, &Criteria::default()), &Criteria::default())
+    }
+
     #[test]
-    fn steady_passes_luck_does_not() {
+    fn steady_or_lucky() {
         let t = 1_800_000_000.0;
-        let c = Criteria::default();
-        let (ok, s) = judge_history(&hist(t, 200, |_| 100.0), t, &c);
-        assert!(ok, "{s}");
+        assert_eq!(steady_of(&hist(t, 200, |_| 100.0), t), Ok(()));
+        let b = record(&hist(t, 200, |_| 100.0), t, &Criteria::default());
+        assert_eq!(b["weeks_up_now"], 17);
+        assert_eq!(b["longest_months_up"], 6);
         // the same profit in one day
-        let (ok, s) = judge_history(&hist(t, 200, |i| if i == 150 { 12_000.0 } else { 0.0 }), t, &c);
-        assert!(!ok);
-        assert_eq!(s["why"], "months in loss");
-        let (ok, s) = judge_history(&hist(t, 200, |i| if i % 30 == 0 { 3000.0 } else { -50.0 }), t, &c);
-        assert!(!ok);
-        assert_eq!(s["why"], "weeks in loss");
-        // too new, and not trading lately
-        assert_eq!(judge_history(&hist(t, 60, |_| 100.0), t, &c).1["why"], "too new");
-        assert_eq!(judge_history(&hist(t - 30.0 * DAY, 200, |_| 100.0), t, &c).1["why"], "not trading lately");
-        // losing months
-        let (ok, _) = judge_history(&hist(t, 200, |i| if (i / 30) % 2 == 0 { 200.0 } else { -150.0 }), t, &c);
-        assert!(!ok);
+        assert_eq!(steady_of(&hist(t, 200, |i| if i == 150 { 12_000.0 } else { 0.0 }), t), Err("months in loss"));
+        assert_eq!(steady_of(&hist(t, 200, |i| if i % 30 == 0 { 3000.0 } else { -50.0 }), t), Err("weeks in loss"));
+        assert_eq!(steady_of(&hist(t, 200, |i| if i == 190 { 9000.0 } else { 10.0 }), t), Err("one lucky day"));
+        assert_eq!(steady_of(&hist(t, 60, |_| 100.0), t), Err("too new"));
+        assert_eq!(steady_of(&hist(t, 200, |i| if (i / 30) % 2 == 0 { 200.0 } else { -150.0 }), t).is_err(), true);
     }
 }

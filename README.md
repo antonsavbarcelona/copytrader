@@ -37,37 +37,38 @@ Report on the server's data from anywhere, with the database's public URL:
 DATABASE_URL=postgresql://... target/release/copytrader report
 ```
 
-## Round one: traders with a record
+## Round one: the big players
 
 Every 24 h (the first 2 min after the start) the run gathers candidates: the 50 biggest
 holders of each outcome and the wallets of the last 1000 trades of $100+ in the ~400 markets
 traded most over the last day (books of $10k+), and the top 500 of Polymarket's leaderboards
-(every category, month and all-time). Each is judged on the profit history behind its
-profile chart (scout.rs). It passes when it:
+(every category, month and all-time). Round one only leaves out the small ones: a wallet
+passes when its median trade (last 500) is $200 or more (`--scout-min-trade`) and it traded
+5+ times in the last week (`--scout-min-week-trades`; a week on paper needs trades).
 
-- has traded for 120 days or more, and this week;
-- made money in 3 of the last 4 months (30 days each), $5,000 or more over them;
-- made money in 60% of those weeks;
-- did not make it in one day (its best day is under half of it);
-- trades for real: its median trade (last 500) is $50 or more.
+Each that passes also gets its record, **metric B**, from the profit history behind its
+profile chart: age, profit over the last 4 months and each month's, months and weeks up,
+the longest runs of months and weeks up, the current run of weeks up, its best day. B decides
+nothing in round one; it is kept for analysis and read again after a profitable week.
 
-Every wallet judged goes to `scouted` (with its record and why it failed), and is judged
-again after 7 days. `copytrader scout` runs round one now and prints the verdicts without
-saving anything.
+Every wallet judged goes to `scouted` (with why it failed), and is judged again after 7
+days. `copytrader scout` runs round one now and prints the verdicts without saving anything.
 
 ## Round two: a week on paper
 
 A wallet that passes goes on trial (`trials`) and is copied on paper from then on (one
 already copied starts its week up to 7 days back, so those copies count). When its week is
 over (checked hourly) it is judged on the copies of the positions it opened that week (sold,
-settled, or held at the market's price now) and on its own profit that week:
+settled, or held at the market's price now); its own profit that week is kept next to them.
 
-- both in profit, on 3+ copies: **golden**;
-- otherwise another week; after two such weeks it is `review` (look at what it trades; it
+- Copies in profit on 3+ copies: B, read again, tells steady from lucky. **Steady** (traded
+  120+ days; 3 of the last 4 months up and the 4 months in profit; 60%+ of their weeks up;
+  best day under half the profit) goes on the **golden list**; **lucky** is dropped.
+- Otherwise another week; after two such weeks it is `review` (look at what it trades; it
   gets a third week), after three it is `rotated` and no longer followed.
 
 Golden wallets stay on paper and are judged on: two losing weeks of copies in a row send one
-back to trial. Every week's numbers are kept in `trials.weeks`.
+back to trial. Every week's numbers (and B when read) are kept in `trials.weeks`.
 
 ## Live (real orders)
 

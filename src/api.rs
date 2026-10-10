@@ -337,10 +337,12 @@ impl Api {
         Ok(v.as_array().map(|a| a.iter().map(|x| (num(&x["t"]), num(&x["p"]))).collect()).unwrap_or_default())
     }
 
-    /// The dollar sizes of the wallet's last `n` trades (up to 500).
-    pub async fn trade_sizes(&self, wallet: &str, n: usize) -> Result<Vec<f64>> {
+    /// The wallet's last `n` trades (up to 500): (unix seconds, dollars).
+    pub async fn trade_sizes(&self, wallet: &str, n: usize) -> Result<Vec<(f64, f64)>> {
         let v = self.get(&format!("{DATA}/trades?user={wallet}&limit={n}&takerOnly=false")).await?;
-        Ok(v.as_array().map(|a| a.iter().map(|t| num(&t["size"]) * num(&t["price"])).collect()).unwrap_or_default())
+        Ok(v.as_array()
+            .map(|a| a.iter().map(|t| (num(&t["timestamp"]), num(&t["size"]) * num(&t["price"]))).collect())
+            .unwrap_or_default())
     }
 
     /// Every wallet on the Polyfox smart-wallet leaderboard.

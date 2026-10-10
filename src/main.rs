@@ -8,11 +8,10 @@
 //!     copytrader test-trade TOKEN [USD]    (a real buy of USD, default 1, then its sale)
 //!     copytrader scout                     (round one now: who passes; read only)
 //!
-//! Round one (scout.rs, every 24 h): the wallets in the liquid markets and on the
-//! leaderboards are judged on their profit history; those steadily in profit for months, with
-//! a real deposit, go on trial. Round two (trial.rs): each is copied on paper against the live
-//! order book (engine.rs) and judged week by week; when its copies and its own trades both
-//! earn, it is on the golden list. Events go to DIR/events.jsonl, open lots to
+//! Round one (scout.rs, every 24 h): the big players in the liquid markets and on the
+//! leaderboards go on trial, with their record of success (metric B). Round two (trial.rs):
+//! each is copied on paper against the live order book (engine.rs) and judged week by week;
+//! when its copies earn and its record is steady, it is on the golden list. Events go to DIR/events.jsonl, open lots to
 //! DIR/state.json, and with DATABASE_URL set also to Postgres (see db.rs), which the trials
 //! need and from which a restart takes the state back.
 //!
@@ -317,11 +316,11 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     }
     if let Some(url) = db_url.clone() {
         // Round two: the weeks that are over are judged, every hour.
-        let api = api.clone();
+        let (api, crit) = (api.clone(), cfg.scout_criteria.clone());
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(300)).await;
-                match async { trial::evaluate(&db::connect(&url).await?, &api).await }.await {
+                match async { trial::evaluate(&db::connect(&url).await?, &api, &crit).await }.await {
                     Ok(0) => {}
                     Ok(n) => log!("trial: {n} weeks judged"),
                     Err(e) => log!("trial: evaluation failed: {e}"),

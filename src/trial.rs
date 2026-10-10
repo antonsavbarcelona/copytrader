@@ -1,17 +1,20 @@
-//! Round two: the week on paper. Every trader that passes round one (scout.rs) is copied on
+//! Round two: the week on paper. Every big player from round one (scout.rs) is copied on
 //! paper and judged week by week on the copies of the trades it made that week (sold,
-//! settled, or still held at the market's price now) next to its own profit that week:
+//! settled, or still held at the market's price now); its own profit that week is kept next
+//! to them.
 //!
-//! - both in profit, on `MIN_BUYS` copies or more: the copy works, the wallet goes on the
-//!   golden list, which the live copy draws from;
-//! - otherwise (it lost, we lost, one without the other, or it hardly traded): another week;
-//!   after two such weeks it is up for review (`review`: look at what it does; it gets a
-//!   third week), after three it is rotated out and no longer followed.
+//! - Copies in profit, on `MIN_BUYS` or more: the copy worked. Then the wallet's record
+//!   (metric B, scout::record, read again now) tells steady from lucky: steady goes on the
+//!   golden list, which the live copy draws from; lucky is dropped (`rotated`).
+//! - Otherwise (the copies lost, or it hardly traded): another week; after two such weeks it
+//!   is up for review (`review`: look at what it does; it gets a third week), after three it
+//!   is rotated out and no longer followed.
 //!
 //! A golden wallet stays on paper and is judged on as well: two weeks in a row of copies in
 //! loss send it back to trial.
 //!
-//! The state is the `trials` table (db.rs); the record of every week is kept in `weeks`.
+//! The state is the `trials` table (db.rs); every week's numbers and record are kept in
+//! `weeks`.
 
 use anyhow::Result;
 use serde_json::{Value, json};
@@ -19,7 +22,7 @@ use tokio_postgres::Client;
 
 use crate::api::Api;
 use crate::log;
-use crate::scout::{Judged, at};
+use crate::scout::{self, Criteria, Judged, at};
 
 const WEEK: f64 = 7.0 * 86400.0;
 /// Fewer copies than this in a week tell nothing.
@@ -134,23 +137,29 @@ async fn week_result(c: &Client, api: &Api, wallet: &str, from: f64) -> Result<V
     }))
 }
 
-/// The next status and strikes after a week.
-fn next(status: &str, strikes: i32, w: &Value) -> (&'static str, i32, &'static str) {
-    let f = |k: &str| w[k].as_f64().unwrap_or(0.0);
-    let active = w["buys"].as_i64().unwrap_or(0) >= MIN_BUYS;
-    let (copy_up, theirs_up) = (f("copy_pnl") > 0.0, f("trader_pnl") > 0.0);
+/// Whether the week's copies worked: in profit, on enough of them (None: too few to tell).
+fn copies_worked(w: &Value) -> Option<bool> {
+    (w["buys"].as_i64().unwrap_or(0) >= MIN_BUYS).then(|| w["copy_pnl"].as_f64().unwrap_or(0.0) > 0.0)
+}
+
+/// The next status and strikes after a week; `steady` is the record's verdict, read only when
+/// the copies worked (Err: why it looks like luck).
+fn next(status: &str, strikes: i32, w: &Value, steady: Result<(), &str>) -> (&'static str, i32, &'static str) {
+    let worked = copies_worked(w);
     if status == "golden" {
-        return match (active, copy_up) {
-            (false, _) => ("golden", strikes, "idle"),
-            (true, true) => ("golden", 0, "pass"),
-            (true, false) if strikes >= 1 => ("trial", 0, "fail"),
-            (true, false) => ("golden", strikes + 1, "fail"),
+        return match worked {
+            None => ("golden", strikes, "idle"),
+            Some(true) => ("golden", 0, "pass"),
+            Some(false) if strikes >= 1 => ("trial", 0, "fail"),
+            Some(false) => ("golden", strikes + 1, "fail"),
         };
     }
-    let verdict = if !active { "idle" } else if copy_up && theirs_up { "pass" } else { "fail" };
-    if verdict == "pass" {
-        return ("golden", 0, verdict);
-    }
+    let verdict = match worked {
+        Some(true) if steady.is_ok() => return ("golden", 0, "pass"),
+        Some(true) => return ("rotated", strikes, "luck"),
+        Some(false) => "fail",
+        None => "idle",
+    };
     match strikes + 1 {
         1 => ("trial", 1, verdict),
         2 => ("review", 2, verdict),
@@ -159,7 +168,7 @@ fn next(status: &str, strikes: i32, w: &Value) -> (&'static str, i32, &'static s
 }
 
 /// Every wallet whose week is over is judged on it; returns how many weeks were judged.
-pub async fn evaluate(c: &Client, api: &Api) -> Result<usize> {
+pub async fn evaluate(c: &Client, api: &Api, crit: &Criteria) -> Result<usize> {
     let due = c
         .query(
             "SELECT wallet, name, status, strikes, week, extract(epoch FROM week_start)::float8 FROM trials
@@ -178,7 +187,24 @@ pub async fn evaluate(c: &Client, api: &Api) -> Result<usize> {
                 continue;
             }
         };
-        let (st, strikes, verdict) = next(&status, strikes, &w);
+        // The record matters once the copies worked: steady or lucky.
+        let mut steady = Ok(());
+        if status != "golden" && copies_worked(&w) == Some(true) {
+            match scout::record_of(api, &wallet, crit).await {
+                Ok(b) => {
+                    steady = scout::steady(&b, crit);
+                    w["record"] = b;
+                }
+                Err(e) => {
+                    log!("trial: {wallet} record read failed, judged next hour: {e}");
+                    continue;
+                }
+            }
+        }
+        let (st, strikes, verdict) = next(&status, strikes, &w, steady);
+        if verdict == "luck" {
+            w["luck"] = json!(steady.err().unwrap_or(""));
+        }
         w["week"] = json!(week);
         w["verdict"] = json!(verdict);
         w["status"] = json!(st);
@@ -210,16 +236,19 @@ mod tests {
 
     #[test]
     fn weeks_move_the_status() {
-        assert_eq!(next("trial", 0, &wk(10, 2.0, 500.0)), ("golden", 0, "pass"));
-        // it won, we lost: not copyable this week
-        assert_eq!(next("trial", 0, &wk(10, -1.0, 500.0)), ("trial", 1, "fail"));
-        assert_eq!(next("trial", 1, &wk(10, -1.0, -500.0)), ("review", 2, "fail"));
-        assert_eq!(next("review", 2, &wk(1, 0.0, 0.0)), ("rotated", 3, "idle"));
-        assert_eq!(next("review", 2, &wk(5, 1.0, 10.0)), ("golden", 0, "pass"));
+        let ok = Ok(());
+        // copies in profit: steady -> golden, lucky -> out
+        assert_eq!(next("trial", 0, &wk(10, 2.0, 500.0), ok), ("golden", 0, "pass"));
+        assert_eq!(next("trial", 0, &wk(10, 2.0, 500.0), Err("one lucky day")), ("rotated", 0, "luck"));
+        // copies in loss, or too few: another week, review, out
+        assert_eq!(next("trial", 0, &wk(10, -1.0, 500.0), ok), ("trial", 1, "fail"));
+        assert_eq!(next("trial", 1, &wk(10, -1.0, -500.0), ok), ("review", 2, "fail"));
+        assert_eq!(next("review", 2, &wk(1, 3.0, 0.0), ok), ("rotated", 3, "idle"));
+        assert_eq!(next("review", 2, &wk(5, 1.0, -10.0), ok), ("golden", 0, "pass"));
         // golden: one week in loss is tolerated, two send it back
-        assert_eq!(next("golden", 0, &wk(10, -1.0, 500.0)), ("golden", 1, "fail"));
-        assert_eq!(next("golden", 1, &wk(10, -1.0, 500.0)), ("trial", 0, "fail"));
-        assert_eq!(next("golden", 1, &wk(0, 0.0, 0.0)), ("golden", 1, "idle"));
-        assert_eq!(next("golden", 1, &wk(10, 1.0, -5.0)), ("golden", 0, "pass"));
+        assert_eq!(next("golden", 0, &wk(10, -1.0, 500.0), ok), ("golden", 1, "fail"));
+        assert_eq!(next("golden", 1, &wk(10, -1.0, 500.0), ok), ("trial", 0, "fail"));
+        assert_eq!(next("golden", 1, &wk(0, 0.0, 0.0), ok), ("golden", 1, "idle"));
+        assert_eq!(next("golden", 1, &wk(10, 1.0, -5.0), ok), ("golden", 0, "pass"));
     }
 }
