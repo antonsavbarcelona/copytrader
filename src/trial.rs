@@ -89,6 +89,41 @@ pub async fn golden(c: &Client, n: i64) -> Result<Vec<(String, Option<String>, f
     .collect())
 }
 
+/// Once, when there are no trials yet: the previous version's live picks (the 10 wallets
+/// whose paper copies opened in the last 3 days did best, on 15+ closed) go on the golden
+/// list as they are, so live copying goes on; from 7 days on they are checked like any golden
+/// wallet. Returns how many.
+pub async fn seed_golden(c: &Client) -> Result<u64> {
+    Ok(c.execute(
+        "WITH k AS (
+           SELECT wallet, token,
+             sum(CASE WHEN kind = 'buy' THEN (data->'fill'->>'usd')::float8 + coalesce((data->'fill'->>'fee')::float8, 0) ELSE 0 END) AS cost,
+             sum(CASE WHEN kind = 'sell' THEN (data->'fill'->>'usd')::float8 - coalesce((data->'fill'->>'fee')::float8, 0)
+                      WHEN kind = 'settle' THEN (data->>'usd')::float8 ELSE 0 END) AS back,
+             sum(CASE WHEN kind = 'buy' THEN (data->'fill'->>'shares')::float8 ELSE 0 END)
+               - sum(CASE WHEN kind = 'sell' THEN (data->'fill'->>'shares')::float8
+                          WHEN kind = 'settle' THEN (data->>'shares')::float8 ELSE 0 END) AS left_
+           FROM events
+           WHERE kind IN ('buy', 'sell', 'settle') AND wallet IS NOT NULL
+           GROUP BY wallet, token
+           HAVING min(at) FILTER (WHERE kind = 'buy') >= now() - interval '3 days'),
+         top AS (
+           SELECT k.wallet, w.name, sum(back - cost) / sum(cost) AS roi, count(*) AS closed
+           FROM k LEFT JOIN wallets w ON w.wallet = k.wallet
+           WHERE cost > 0 AND left_ <= 1e-6
+           GROUP BY k.wallet, w.name
+           HAVING count(*) >= 15 AND sum(back - cost) > 0
+           ORDER BY roi DESC LIMIT 10)
+         INSERT INTO trials (wallet, name, status, week_start, golden_since, scout, last)
+         SELECT wallet, name, 'golden', now(), now(), jsonb_build_object('seed', 'live top-10 of the previous version'),
+                jsonb_build_object('copy_roi', round(roi::numeric, 3), 'closed', closed, 'seed', true)
+         FROM top WHERE NOT EXISTS (SELECT 1 FROM trials)
+         ON CONFLICT (wallet) DO NOTHING",
+        &[],
+    )
+    .await?)
+}
+
 /// The paper copies of the positions the wallet first bought in [from, to): (token, cost,
 /// back, shares left, buys).
 async fn copies(c: &Client, wallet: &str, from: f64, to: f64) -> Result<Vec<(String, f64, f64, f64, i64)>> {

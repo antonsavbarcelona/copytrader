@@ -256,6 +256,16 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         }
     };
 
+    if let Some(url) = &db_url {
+        // The first start with trials: the previous version's live top-10 is the golden list
+        // until the trials have one of their own.
+        match async { trial::seed_golden(&db::connect(url).await?).await }.await {
+            Ok(0) => {}
+            Ok(n) => log!("trial: the previous live top-{n} starts as the golden list"),
+            Err(e) => log!("trial: golden seed failed: {e}"),
+        }
+    }
+
     // Paper: the wallets on trial and the golden ones.
     let paper = engine::Engine::open(cfg.clone(), api.clone(), db_tx.clone(), paper_state, None)?;
     let paper_wallets: Wallets = Arc::new(RwLock::new(HashSet::new()));

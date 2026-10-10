@@ -72,6 +72,10 @@ Golden wallets stay on paper and are checked daily too: their last 7 days of cop
 and the 7 before them as well send one back to a new trial. The last 60 checks (and B when
 read) are kept in `trials.weeks`.
 
+On the first start with trials, the previous version's live top-10 (best paper copies of
+the last 3 days) is put on the golden list as it is, so live copying goes on; from day 7
+those wallets are checked like any golden one.
+
 ## Live (real orders)
 
 The same service also copies for real once the account's keys are in its variables (next to
