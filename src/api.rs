@@ -1,5 +1,6 @@
 //! Polymarket's public HTTP APIs (no keys): the CLOB order book, gamma market metadata, the
-//! data API's trades and positions, and the Polyfox smart-wallet leaderboard.
+//! data API's trades, positions, holders and leaderboards, the profit history behind a
+//! profile's chart, and the Polyfox smart-wallet leaderboard.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use tokio::sync::Mutex;
 const CLOB: &str = "https://clob.polymarket.com";
 const GAMMA: &str = "https://gamma-api.polymarket.com";
 const DATA: &str = "https://data-api.polymarket.com";
+const PNL: &str = "https://user-pnl-api.polymarket.com/user-pnl";
 const POLYFOX: &str = "https://polyfox.co/api/leaderboard";
 
 #[derive(Clone, Debug)]
@@ -262,14 +264,14 @@ impl Api {
         Ok(out)
     }
 
-    /// Polymarket's crypto leaderboard by profit over `period` (DAY, WEEK, MONTH, ALL): the
-    /// first `n` wallets.
-    pub async fn crypto_leaders(&self, period: &str, n: usize) -> Result<Vec<WalletInfo>> {
+    /// Polymarket's leaderboard of `category` (OVERALL, POLITICS, SPORTS, CRYPTO ...) by
+    /// profit over `period` (DAY, WEEK, MONTH, ALL): the first `n` wallets.
+    pub async fn leaders(&self, category: &str, period: &str, n: usize) -> Result<Vec<WalletInfo>> {
         let mut out = Vec::new();
         let mut off = 0;
         while out.len() < n {
             let v = self
-                .get(&format!("{DATA}/v1/leaderboard?category=CRYPTO&timePeriod={period}&orderBy=PNL&limit=50&offset={off}"))
+                .get(&format!("{DATA}/v1/leaderboard?category={category}&timePeriod={period}&orderBy=PNL&limit=50&offset={off}"))
                 .await?;
             let rows = v.as_array().cloned().unwrap_or_default();
             for r in &rows {
@@ -287,25 +289,58 @@ impl Api {
         Ok(out)
     }
 
-    /// The wallet's closed positions, newest first, up to `max`.
-    pub async fn closed_positions(&self, wallet: &str, max: usize) -> Result<Vec<Value>> {
+    /// The open markets traded most over the last day, with at least `min_liquidity` dollars
+    /// on their books: (condition id, question), up to `n`.
+    pub async fn liquid_markets(&self, n: usize, min_liquidity: f64) -> Result<Vec<(String, String)>> {
         let mut out = Vec::new();
-        while out.len() < max {
+        for off in (0..n).step_by(100) {
             let v = self
-                .get(&format!(
-                    "{DATA}/closed-positions?user={wallet}&limit=50&offset={}&sortBy=TIMESTAMP&sortDirection=DESC",
-                    out.len()
-                ))
+                .get(&format!("{GAMMA}/markets?active=true&closed=false&order=volume24hr&ascending=false&limit=100&offset={off}"))
                 .await?;
             let rows = v.as_array().cloned().unwrap_or_default();
-            let n = rows.len();
-            out.extend(rows);
-            if n < 50 {
+            out.extend(
+                rows.iter()
+                    .filter(|m| num(&m["liquidityNum"]) >= min_liquidity)
+                    .map(|m| (s(&m["conditionId"]), s(&m["question"]))),
+            );
+            if rows.len() < 100 {
                 break;
             }
         }
-        out.truncate(max);
         Ok(out)
+    }
+
+    /// Who is in the market: its 50 biggest holders of each outcome and the wallets of its
+    /// last 1000 trades of `min_usd` or more.
+    pub async fn market_traders(&self, condition: &str, min_usd: f64) -> Result<Vec<WalletInfo>> {
+        let mut out = Vec::new();
+        let who = |r: &Value| WalletInfo {
+            address: s(&r["proxyWallet"]).to_lowercase(),
+            name: r["name"].as_str().filter(|n| !n.is_empty()).map(str::to_string),
+        };
+        let v = self.get(&format!("{DATA}/holders?market={condition}&limit=50")).await?;
+        for t in v.as_array().into_iter().flatten() {
+            out.extend(t["holders"].as_array().into_iter().flatten().map(who));
+        }
+        let v = self
+            .get(&format!("{DATA}/trades?market={condition}&limit=1000&takerOnly=false&filterType=CASH&filterAmount={min_usd}"))
+            .await?;
+        out.extend(v.as_array().into_iter().flatten().map(who));
+        Ok(out)
+    }
+
+    /// The wallet's profit over time as its profile chart shows it (realized and open
+    /// positions): (unix seconds, cumulative dollars), oldest first. `interval` all / 1m / 1w,
+    /// `fidelity` 1d / 1h.
+    pub async fn pnl_history(&self, wallet: &str, interval: &str, fidelity: &str) -> Result<Vec<(f64, f64)>> {
+        let v = self.get(&format!("{PNL}?user_address={wallet}&interval={interval}&fidelity={fidelity}")).await?;
+        Ok(v.as_array().map(|a| a.iter().map(|x| (num(&x["t"]), num(&x["p"]))).collect()).unwrap_or_default())
+    }
+
+    /// The dollar sizes of the wallet's last `n` trades (up to 500).
+    pub async fn trade_sizes(&self, wallet: &str, n: usize) -> Result<Vec<f64>> {
+        let v = self.get(&format!("{DATA}/trades?user={wallet}&limit={n}&takerOnly=false")).await?;
+        Ok(v.as_array().map(|a| a.iter().map(|t| num(&t["size"]) * num(&t["price"])).collect()).unwrap_or_default())
     }
 
     /// Every wallet on the Polyfox smart-wallet leaderboard.

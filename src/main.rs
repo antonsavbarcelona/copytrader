@@ -1,37 +1,37 @@
-//! Copy-trading of the Polyfox smart wallets on Polymarket: on paper, and live alongside it.
+//! Copy-trading on Polymarket: traders found by their record, tried a week on paper, the
+//! golden ones copied live.
 //!
 //!     copytrader run    [--data DIR] [--stake 1] [--cap 0.02] [--sell-floor 0.05] [--market-gap-h 6]
-//!                       [--top 10] [--top-days 3] [--top-min-closed 15]
+//!                       [--top 10] [--no-scout] [--polyfox]
 //!     copytrader report [--data DIR] [--hours 24] [--live]
 //!     copytrader check                     (the live keys: account and cash, no order)
 //!     copytrader test-trade TOKEN [USD]    (a real buy of USD, default 1, then its sale)
-//!     copytrader discover                  (who a crypto-market scan would add; read only)
+//!     copytrader scout                     (round one now: who passes; read only)
 //!
-//! `run` follows every wallet on the Polyfox leaderboard (read again every 6 h) and copies
-//! their buys and sales on paper against the live order book; see engine.rs for the rules.
-//! Events go to DIR/events.jsonl, open lots to DIR/state.json, and with DATABASE_URL set
-//! also to Postgres (see db.rs), from which a restart takes the state back.
-//!
-//! Traders of the short crypto markets (Up or Down) found on Polymarket's crypto leaderboard
-//! join the paper copy too (discover.rs; --no-discover leaves them out). After a week on paper,
-//! a wallet whose copies earned is on the golden list (`golden` table).
+//! Round one (scout.rs, every 24 h): the wallets in the liquid markets and on the
+//! leaderboards are judged on their profit history; those steadily in profit for months, with
+//! a real deposit, go on trial. Round two (trial.rs): each is copied on paper against the live
+//! order book (engine.rs) and judged week by week; when its copies and its own trades both
+//! earn, it is on the golden list. Events go to DIR/events.jsonl, open lots to
+//! DIR/state.json, and with DATABASE_URL set also to Postgres (see db.rs), which the trials
+//! need and from which a restart takes the state back.
 //!
 //! With the live keys in the environment (live.rs) and DATABASE_URL set, the same process
-//! also copies for real: the `--top` golden wallets whose paper copies did best over the last
-//! `--top-days`, with their own trade stream and read-back, events in `live_events` and
-//! DIR/live. LIVE=off leaves the keys unused.
+//! also copies for real: the golden wallets (`--top` at most), with their own trade stream and
+//! read-back, events in `live_events` and DIR/live. LIVE=off leaves the keys unused.
 
 mod api;
 mod config;
 mod db;
-mod discover;
 mod engine;
 mod fill;
 mod live;
 mod report;
+mod scout;
 mod stream;
+mod trial;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,56 +52,52 @@ const NO_TRADES_EXIT_S: u64 = 30 * 60;
 
 type Wallets = Arc<RwLock<HashSet<String>>>;
 
-/// The paper copy's wallets: the Polyfox leaderboard, the crypto traders found so far (from
-/// the database) and those whose lots are still held.
-async fn refresh_wallets(api: &api::Api, engine: &engine::Engine, wallets: &RwLock<HashSet<String>>,
-    path: &std::path::Path, db: Option<&mpsc::UnboundedSender<db::Write>>, db_url: Option<&str>) {
-    let crypto = match db_url {
-        Some(url) => match db::connect(url).await {
-            Ok(c) => db::crypto_wallets(&c).await.unwrap_or_default(),
-            Err(_) => Vec::new(),
-        },
-        None => Vec::new(),
-    };
-    match api.polyfox_wallets().await {
-        Ok(list) => {
-            if let Some(db) = db {
-                let _ = db.send(db::Write::Wallets(list.iter().map(|w| (w.address.clone(), w.name.clone())).collect()));
+/// The paper copy's wallets: those on trial or golden, with --polyfox the Polyfox
+/// leaderboard, and those whose lots are still held.
+async fn refresh_wallets(cfg: &config::Config, api: &api::Api, engine: &engine::Engine, wallets: &RwLock<HashSet<String>>,
+    db: Option<&mpsc::UnboundedSender<db::Write>>, db_url: Option<&str>) {
+    let mut set: HashSet<String> = HashSet::new();
+    if let Some(url) = db_url {
+        match async { trial::followed(&db::connect(url).await?).await }.await {
+            Ok(list) => set.extend(list),
+            Err(e) => {
+                log!("wallets: trials read failed, list kept: {e}");
+                return;
             }
-            let mut set: HashSet<String> = list.iter().map(|w| w.address.clone()).collect();
-            let rows: Vec<serde_json::Value> =
-                list.iter().map(|w| serde_json::json!({"wallet": w.address, "name": w.name})).collect();
-            let _ = std::fs::write(path, serde_json::to_string_pretty(&rows).unwrap_or_default());
-            set.extend(crypto.iter().cloned());
-            // Wallets that left the leaderboard are still followed while we hold their lots.
-            set.extend(engine.wallets_held().await);
-            let mut w = wallets.write().await;
-            let added = set.difference(&w).count();
-            *w = set;
-            log!("wallets: {} followed ({} found in the crypto markets, {added} new)", w.len(), crypto.len());
         }
-        Err(e) => log!("wallets: Polyfox read failed: {e}"),
     }
+    let on_trial = set.len();
+    if cfg.polyfox {
+        match api.polyfox_wallets().await {
+            Ok(list) => {
+                if let Some(db) = db {
+                    let _ = db.send(db::Write::Wallets(list.iter().map(|w| (w.address.clone(), w.name.clone())).collect()));
+                }
+                let rows: Vec<serde_json::Value> =
+                    list.iter().map(|w| serde_json::json!({"wallet": w.address, "name": w.name})).collect();
+                let _ = std::fs::write(cfg.data_dir.join("wallets.json"), serde_json::to_string_pretty(&rows).unwrap_or_default());
+                set.extend(list.into_iter().map(|w| w.address));
+            }
+            Err(e) => log!("wallets: Polyfox read failed: {e}"),
+        }
+    }
+    // Wallets no longer followed are still read while we hold their lots, for their sales.
+    set.extend(engine.wallets_held().await);
+    let mut w = wallets.write().await;
+    let added = set.difference(&w).count();
+    *w = set;
+    log!("wallets: {} followed ({on_trial} on trial or golden, {added} new)", w.len());
 }
 
-/// Live: the wallets to copy, the best of the paper copies lately.
+/// Live: the wallets to copy, the golden list.
 async fn refresh_top(cfg: &config::Config, url: &str, engine: &engine::Engine, wallets: &RwLock<HashSet<String>>) {
-    let top = match db::connect(url).await {
-        Ok(c) => match db::golden_wallets(&c, cfg.golden_days, cfg.golden_min_closed).await {
-            Ok(golden) => {
-                log!("golden list: {} wallets ({} days on paper, {}+ closed copies, in profit)", golden.len(),
-                    cfg.golden_days, cfg.golden_min_closed);
-                let among: Vec<String> = golden.into_iter().map(|(w, ..)| w).collect();
-                db::top_wallets(&c, cfg.top_days, cfg.top_min_closed, cfg.top_n, &among).await
+    match async { trial::golden(&db::connect(url).await?, cfg.top_n).await }.await {
+        Ok(list) => {
+            for (w, name, roi) in &list {
+                log!("live: copying {} (golden, copies {:+.1}% last week)", name.as_deref().unwrap_or(w), roi * 100.0);
             }
-            Err(e) => Err(e),
-        },
-        Err(e) => Err(e),
-    };
-    match top {
-        Ok(list) if !list.is_empty() => {
-            for (w, name, roi, closed) in &list {
-                log!("live top: {} {:+.1}% over {closed} closed", name.as_deref().unwrap_or(w), roi * 100.0);
+            if list.is_empty() {
+                log!("live: the golden list is empty, no new copies");
             }
             let mut set: HashSet<String> = list.into_iter().map(|(w, ..)| w).collect();
             // Held lots keep their wallet followed, for its sales.
@@ -110,8 +106,7 @@ async fn refresh_top(cfg: &config::Config, url: &str, engine: &engine::Engine, w
             *w = set;
             log!("live: {} wallets followed", w.len());
         }
-        Ok(_) => log!("live top: no wallet qualifies, list kept"),
-        Err(e) => log!("live top: read failed, list kept: {e}"),
+        Err(e) => log!("live: golden list read failed, list kept: {e}"),
     }
 }
 
@@ -156,13 +151,25 @@ async fn main() -> anyhow::Result<()> {
         println!("signer {}\nproxy wallet {}\ncash ${:.2}", l.signer_address(), l.funder, l.cash().await?);
         return Ok(());
     }
-    if cmd == "discover" {
-        // Who a scan of the crypto markets would add to the paper copy now; nothing is saved.
+    if cmd == "scout" {
+        // Round one now, without saving: who would go on trial.
         let cfg = config::Config::default();
-        let found = discover::scan(&api::Api::new()?, &cfg.discover_criteria, &HashSet::new(), &mut HashMap::new()).await;
-        for f in &found {
-            println!("{} {} {}", f.wallet, f.name.as_deref().unwrap_or("-"), f.stats);
-        }
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let api = api::Api::new()?;
+        // Every wallet judged, one JSON line each, then why the others failed.
+        let print = tokio::spawn(async move {
+            let mut why: std::collections::BTreeMap<String, usize> = Default::default();
+            while let Some(j) = rx.recv().await {
+                let j: scout::Judged = j;
+                println!("{}", serde_json::json!({"wallet": j.wallet, "name": j.name, "ok": j.ok, "stats": j.stats}));
+                *why.entry(j.stats["why"].as_str().unwrap_or("").to_string()).or_default() += 1;
+            }
+            why
+        });
+        let (n, ok) = scout::scan(&api, &cfg.scout_criteria, &HashSet::new(), &tx).await;
+        drop(tx);
+        let why = print.await?;
+        eprintln!("{ok} of {n} pass; failed: {why:?}");
         return Ok(());
     }
     if cmd == "order" {
@@ -184,7 +191,7 @@ async fn main() -> anyhow::Result<()> {
         let mut e = Vec::new();
         let mut i = 0;
         while i < rest.len() {
-            if rest[i] == "--live" || rest[i] == "--no-discover" {
+            if ["--live", "--no-scout", "--polyfox"].contains(&rest[i].as_str()) {
                 c.push(rest[i].clone());
                 i += 1;
                 continue;
@@ -250,43 +257,76 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         }
     };
 
-    // Paper: every Polyfox wallet.
+    // Paper: the wallets on trial and the golden ones.
     let paper = engine::Engine::open(cfg.clone(), api.clone(), db_tx.clone(), paper_state, None)?;
     let paper_wallets: Wallets = Arc::new(RwLock::new(HashSet::new()));
-    let wallets_path = cfg.data_dir.join("wallets.json");
-    refresh_wallets(&api, &paper, &paper_wallets, &wallets_path, db_tx.as_ref(), db_url.as_deref()).await;
+    refresh_wallets(&cfg, &api, &paper, &paper_wallets, db_tx.as_ref(), db_url.as_deref()).await;
     if paper_wallets.read().await.is_empty() {
-        anyhow::bail!("no wallets to follow (Polyfox read failed)");
+        log!("wallets: none yet, the first scout fills the trials");
     }
     let mut tasks = spawn_copier("paper", &cfg, &api, &paper, &paper_wallets);
     {
-        let (api, engine, wallets, db_tx, url) = (api.clone(), paper.clone(), paper_wallets.clone(), db_tx.clone(), db_url.clone());
-        let every = cfg.wallets_refresh_s;
+        let (cfg, api, engine, wallets, db_tx, url) =
+            (cfg.clone(), api.clone(), paper.clone(), paper_wallets.clone(), db_tx.clone(), db_url.clone());
         tokio::spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(every)).await;
-                refresh_wallets(&api, &engine, &wallets, &wallets_path, db_tx.as_ref(), url.as_deref()).await;
+                tokio::time::sleep(Duration::from_secs(cfg.wallets_refresh_s)).await;
+                refresh_wallets(&cfg, &api, &engine, &wallets, db_tx.as_ref(), url.as_deref()).await;
             }
         });
     }
-    if let (true, Some(db)) = (cfg.discover, db_tx.clone()) {
-        // Traders found in the crypto markets join the paper copy at once and stay in it
-        // (saved in `wallets`, read back on every refresh).
-        let (api, wallets, cfg) = (api.clone(), paper_wallets.clone(), cfg.clone());
-        tokio::spawn(async move {
-            let mut judged: HashMap<String, f64> = HashMap::new();
-            // Not in the start's rush of requests.
-            tokio::time::sleep(Duration::from_secs(120)).await;
-            loop {
-                let known = wallets.read().await.clone();
-                let found = discover::scan(&api, &cfg.discover_criteria, &known, &mut judged).await;
-                if !found.is_empty() {
-                    let _ = db.send(db::Write::Discovered(found.iter().map(|f| (f.wallet.clone(), f.name.clone(), f.stats.clone())).collect()));
-                    let mut w = wallets.write().await;
-                    w.extend(found.into_iter().map(|f| f.wallet));
-                    log!("wallets: {} followed", w.len());
+    match (&db_url, cfg.scout) {
+        (None, _) => log!("scout: off, the trials need DATABASE_URL"),
+        (Some(_), false) => log!("scout: off (--no-scout); trials go on"),
+        (Some(url), true) => {
+            // Round one: the wallets that pass go on trial and on paper at once.
+            let (tx, mut rx) = mpsc::unbounded_channel::<scout::Judged>();
+            {
+                let (url, wallets) = (url.clone(), paper_wallets.clone());
+                tokio::spawn(async move {
+                    while let Some(j) = rx.recv().await {
+                        let r = async { trial::enroll(&db::connect(&url).await?, std::slice::from_ref(&j)).await }.await;
+                        match r {
+                            Ok(1) => {
+                                let mut w = wallets.write().await;
+                                w.insert(j.wallet.clone());
+                                log!("trial: {} starts its week on paper ({} wallets followed)",
+                                    j.name.as_deref().unwrap_or(&j.wallet), w.len());
+                            }
+                            Ok(_) => {}
+                            Err(e) => log!("scout: {} not saved: {e}", j.wallet),
+                        }
+                    }
+                });
+            }
+            let (api, cfg, url) = (api.clone(), cfg.clone(), url.clone());
+            tokio::spawn(async move {
+                // Not in the start's rush of requests.
+                tokio::time::sleep(Duration::from_secs(120)).await;
+                loop {
+                    match async { trial::known(&db::connect(&url).await?, cfg.rescout_days).await }.await {
+                        Ok(known) => {
+                            scout::scan(&api, &cfg.scout_criteria, &known.into_iter().collect(), &tx).await;
+                        }
+                        Err(e) => log!("scout: trials read failed, scan skipped: {e}"),
+                    }
+                    tokio::time::sleep(Duration::from_secs(cfg.scout_every_s)).await;
                 }
-                tokio::time::sleep(Duration::from_secs(cfg.discover_every_s)).await;
+            });
+        }
+    }
+    if let Some(url) = db_url.clone() {
+        // Round two: the weeks that are over are judged, every hour.
+        let api = api.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(300)).await;
+                match async { trial::evaluate(&db::connect(&url).await?, &api).await }.await {
+                    Ok(0) => {}
+                    Ok(n) => log!("trial: {n} weeks judged"),
+                    Err(e) => log!("trial: evaluation failed: {e}"),
+                }
+                tokio::time::sleep(Duration::from_secs(3300)).await;
             }
         });
     }

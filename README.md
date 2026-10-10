@@ -1,8 +1,8 @@
 # copytrader
 
-Paper copy-trading of the Polyfox smart wallets on Polymarket: every buy and sale of every
-wallet on the [Polyfox leaderboard](https://polyfox.co/smart-wallets) (~450, read again every
-6 h) is copied on paper against the live order book, the way a real $1 copy would fill.
+Copy-trading on Polymarket in three steps: traders are found by their record (round one), each
+is copied on paper for a week against the live order book, the way a real $1 copy would fill
+(round two), and those whose copies earn are copied live (the golden list).
 
 ```
 cargo build --release
@@ -15,7 +15,8 @@ The running paper copy uses a copy of the binary (`data/bin/copytrader.exe`), so
 does not fail on a locked `target/release/copytrader.exe`.
 
 `run` options: `--stake 1` (USD per buy), `--cap 0.02` (max price over the wallet's),
-`--sell-floor 0.05`, `--market-gap-h 6`.
+`--sell-floor 0.05`, `--market-gap-h 6`, `--no-scout` (no round one), `--polyfox` (also copy
+every Polyfox wallet on paper, as before).
 
 ## Deploy (Railway)
 
@@ -36,18 +37,37 @@ Report on the server's data from anywhere, with the database's public URL:
 DATABASE_URL=postgresql://... target/release/copytrader report
 ```
 
-## Crypto traders and the golden list
+## Round one: traders with a record
 
-Every 6 h the run also reads Polymarket's crypto leaderboard (week and month, top 100) and
-adds to the paper copy every wallet with 10+ closed positions in the short crypto markets
-("Bitcoin Up or Down", ETH, SOL, XRP ...): no other filter, bots included. They are saved in
-`wallets` (`source = 'crypto'`, their own record in `stats`) and followed from then on.
-`copytrader discover` shows who a scan would add, without saving anything.
+Every 24 h (the first 2 min after the start) the run gathers candidates: the 50 biggest
+holders of each outcome and the wallets of the last 1000 trades of $100+ in the ~400 markets
+traded most over the last day (books of $10k+), and the top 500 of Polymarket's leaderboards
+(every category, month and all-time). Each is judged on the profit history behind its
+profile chart (scout.rs). It passes when it:
 
-The golden list (`golden` table, `active`) is the wallets followed on paper for 7 days or more
-whose copies of the last 7 days closed 30+ times in profit (`--golden-days`,
-`--golden-min-closed`); Polyfox wallets go by the same rule. The live copy picks its wallets
-from it only.
+- has traded for 120 days or more, and this week;
+- made money in 3 of the last 4 months (30 days each), $5,000 or more over them;
+- made money in 60% of those weeks;
+- did not make it in one day (its best day is under half of it);
+- trades for real: its median trade (last 500) is $50 or more.
+
+Every wallet judged goes to `scouted` (with its record and why it failed), and is judged
+again after 7 days. `copytrader scout` runs round one now and prints the verdicts without
+saving anything.
+
+## Round two: a week on paper
+
+A wallet that passes goes on trial (`trials`) and is copied on paper from then on (one
+already copied starts its week up to 7 days back, so those copies count). When its week is
+over (checked hourly) it is judged on the copies of the positions it opened that week (sold,
+settled, or held at the market's price now) and on its own profit that week:
+
+- both in profit, on 3+ copies: **golden**;
+- otherwise another week; after two such weeks it is `review` (look at what it trades; it
+  gets a third week), after three it is `rotated` and no longer followed.
+
+Golden wallets stay on paper and are judged on: two losing weeks of copies in a row send one
+back to trial. Every week's numbers are kept in `trials.weeks`.
 
 ## Live (real orders)
 
@@ -65,9 +85,8 @@ The log says `live: ON, signer .. proxy wallet .. cash $..` at the start (or why
 the paper copy runs either way). `copytrader check` shows the account and cash without an
 order, `copytrader test-trade TOKEN [USD]` makes a real buy and sells it back.
 
-Live copies only the `--top` (10) golden wallets whose paper copies returned the most over the last
-`--top-days` (3; closed positions, at least `--top-min-closed` 15, positive), picked again
-every 6 h, with its own trade stream and read-back (a 10-wallet round takes seconds);
+Live copies the golden wallets (at most `--top` 10, the best copies of last week first),
+picked again every 6 h, with its own trade stream and read-back (a 10-wallet round takes seconds);
 wallets whose lots it holds stay followed for their sales. Buys are FAK market orders capped
 at up to 3 cents a share over the wallet's price (`--live-cap-abs 0.03`; the paper cap when
 that is wider), skipped when the cash is short; sales are FAK, never more than the
@@ -83,7 +102,8 @@ condition, [1, 2])`, through `relayer-v2.polymarket.com`: no POL needed), tried 
   full event in `data` jsonb). The view `buys` lays the buys out in columns (phase, missed,
   wallet price, fill price, usd, fee, vs_wallet_bps, detect_s).
 - `state`: the engine's state (`id = 'main'`); `saved_at` doubles as a heartbeat.
-- `wallets`: the Polyfox wallets followed, with first and last seen.
+- `wallets`: the Polyfox wallets followed (with --polyfox), with first and last seen.
+- `scouted`: round one's verdicts; `trials`: round two (status, weeks).
 
 ## Copy rules
 

@@ -28,28 +28,25 @@ pub struct Config {
     pub recheck_s: f64,
     /// Pause between two wallets' REST read-backs (the whole list is read in turn).
     pub poll_gap_ms: u64,
-    /// How often the Polyfox leaderboard is read again for new wallets.
+    /// How often the wallets followed are read again (trials, Polyfox) and the live ones picked.
     pub wallets_refresh_s: u64,
     /// How often held outcomes are checked for settlement.
     pub settle_every_s: u64,
     /// Real orders (live.rs) instead of paper fills, events to their own tables.
     pub live: bool,
-    /// Live: copy only the `top_n` wallets whose paper copies did best over `top_days`
-    /// (positive return, at least `top_min_closed` closed positions), picked again every
-    /// `wallets_refresh_s`.
+    /// Live: copy the golden list (trial.rs), at most `top_n` wallets, the best of last week
+    /// first.
     pub top_n: i64,
-    pub top_days: f64,
-    pub top_min_closed: i64,
     /// The live copy pays up to this much a share over the wallet's price.
     pub live_cap_abs: f64,
-    /// Look for traders in the short crypto markets and paper-copy them (discover.rs).
-    pub discover: bool,
-    pub discover_every_s: u64,
-    pub discover_criteria: crate::discover::Criteria,
-    /// The golden list (the live copy's pool): followed on paper `golden_days` at least, with
-    /// `golden_min_closed` closed copies in the last `golden_days` and a profit on them.
-    pub golden_days: f64,
-    pub golden_min_closed: i64,
+    /// Round one (scout.rs) every `scout_every_s`; a wallet judged is judged again after
+    /// `rescout_days`.
+    pub scout: bool,
+    pub scout_every_s: u64,
+    pub rescout_days: f64,
+    pub scout_criteria: crate::scout::Criteria,
+    /// Also paper-copy every Polyfox wallet (not part of the trials).
+    pub polyfox: bool,
 }
 
 impl Default for Config {
@@ -70,28 +67,18 @@ impl Default for Config {
             settle_every_s: 300,
             live: false,
             top_n: 10,
-            top_days: 3.0,
-            top_min_closed: 15,
             live_cap_abs: 0.03,
-            discover: true,
-            discover_every_s: 6 * 3600,
-            // Everyone trading these markets gets the week on paper: the copies decide, not
-            // the wallet's own record (the other thresholds are off).
-            discover_criteria: crate::discover::Criteria {
-                min_positions: 10,
-                min_pnl: f64::NEG_INFINITY,
-                min_roi: f64::NEG_INFINITY,
-                min_week_share: 0.0,
-                max_per_day: f64::INFINITY,
-            },
-            golden_days: 7.0,
-            golden_min_closed: 30,
+            scout: true,
+            scout_every_s: 24 * 3600,
+            rescout_days: 7.0,
+            scout_criteria: crate::scout::Criteria::default(),
+            polyfox: false,
         }
     }
 }
 
 impl Config {
-    /// `--data DIR --stake 1 --cap 0.02 --sell-floor 0.05 --live --top 10 --top-days 3` over
+    /// `--data DIR --stake 1 --cap 0.02 --sell-floor 0.05 --live --top 10 --no-scout --polyfox` over
     /// the defaults.
     pub fn from_args(args: &[String]) -> anyhow::Result<Self> {
         let mut c = Self::default();
@@ -103,8 +90,8 @@ impl Config {
                 i += 1;
                 continue;
             }
-            if args[i] == "--no-discover" {
-                c.discover = false;
+            if args[i] == "--no-scout" || args[i] == "--polyfox" {
+                if args[i] == "--polyfox" { c.polyfox = true } else { c.scout = false }
                 i += 1;
                 continue;
             }
@@ -116,11 +103,8 @@ impl Config {
                 "--sell-floor" => c.sell_floor_pct = v()?.parse()?,
                 "--market-gap-h" => c.market_gap_s = v()?.parse::<f64>()? * 3600.0,
                 "--top" => c.top_n = v()?.parse()?,
-                "--top-days" => c.top_days = v()?.parse()?,
-                "--top-min-closed" => c.top_min_closed = v()?.parse()?,
-                "--golden-days" => c.golden_days = v()?.parse()?,
-                "--golden-min-closed" => c.golden_min_closed = v()?.parse()?,
-                "--discover-min-pnl" => c.discover_criteria.min_pnl = v()?.parse()?,
+                "--scout-min-pnl" => c.scout_criteria.min_pnl = v()?.parse()?,
+                "--scout-min-trade" => c.scout_criteria.min_median_trade = v()?.parse()?,
                 other => anyhow::bail!("unknown option {other}"),
             }
             i += 2;
