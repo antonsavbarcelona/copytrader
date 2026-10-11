@@ -2,7 +2,7 @@
 //! golden ones copied live.
 //!
 //!     copytrader run    [--data DIR] [--stake 1] [--cap 0.02] [--sell-floor 0.05] [--market-gap-h 6]
-//!                       [--top 10] [--no-scout] [--polyfox]
+//!                       [--top 10] [--no-scout] [--polyfox] [--wallets-file F] [--poll-file F]
 //!     copytrader report [--data DIR] [--hours 24] [--live]
 //!     copytrader check                     (the live keys: account and cash, no order)
 //!     copytrader test-trade TOKEN [USD]    (a real buy of USD, default 1, then its sale)
@@ -19,6 +19,10 @@
 //! With the live keys in the environment (live.rs) and DATABASE_URL set, the same process
 //! also copies for real: the golden wallets (`--top` at most), with their own trade stream and
 //! read-back, events in `live_events` and DIR/live. LIVE=off leaves the keys unused.
+//!
+//! With --wallets-file the paper copies the wallets in that file (the backtest's picks) and
+//! nothing else: the trials stand still, and live buys nothing new, only follows its held lots
+//! to their sale or settlement and redeems them.
 
 mod api;
 mod config;
@@ -108,6 +112,12 @@ async fn refresh_wallets(cfg: &config::Config, api: &api::Api, engine: &engine::
 
 /// Live: the wallets to copy, the golden list.
 async fn refresh_top(cfg: &config::Config, url: &str, engine: &engine::Engine, wallets: &RwLock<HashSet<String>>) {
+    if cfg.wallets_file.is_some() {
+        let held = engine.wallets_held().await;
+        log!("live: no new copies (the paper runs on the wallet file); {} wallets followed for their held lots", held.len());
+        *wallets.write().await = held;
+        return;
+    }
     match async { trial::golden(&db::connect(url).await?, cfg.top_n).await }.await {
         Ok(list) => {
             for (w, name, roi) in &list {
@@ -143,8 +153,9 @@ fn read_wallets(path: &std::path::Path) -> anyhow::Result<HashSet<String>> {
 fn spawn_copier(name: &'static str, cfg: &config::Config, api: &api::Api, engine: &Arc<engine::Engine>, wallets: &Wallets)
     -> Vec<(String, JoinHandle<()>)> {
     let (tx, rx) = mpsc::channel(10_000);
-    // The read-back reads every wallet followed, or with --poll-file only those.
-    let polled = match cfg.poll_file.as_deref().map(read_wallets) {
+    // The read-back reads every wallet followed, or on paper with --poll-file only those
+    // (live must never read wallets it does not copy: their trades would be bought).
+    let polled = match cfg.poll_file.as_deref().filter(|_| !cfg.live).map(read_wallets) {
         Some(Ok(set)) => {
             log!("{name}: read-back of the {} wallets in the poll file", set.len());
             Arc::new(RwLock::new(set))
@@ -297,7 +308,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         }
     };
 
-    if let Some(url) = &db_url {
+    if let (Some(url), None) = (&db_url, &cfg.wallets_file) {
         // The first start with trials: the previous version's live top-10 stands in for the
         // golden list until the trials have one of their own.
         match async { trial::seed_golden(&db::connect(url).await?).await }.await {
@@ -327,6 +338,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
     }
     match (&db_url, cfg.scout) {
         (None, _) => log!("scout: off, the trials need DATABASE_URL"),
+        (Some(_), _) if cfg.wallets_file.is_some() => log!("scout: off, the trials stand still (--wallets-file)"),
         (Some(_), false) => log!("scout: off (--no-scout); trials go on"),
         (Some(url), true) => {
             // Round one: the wallets that pass go on trial and on paper at once.
@@ -365,7 +377,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
             });
         }
     }
-    if let Some(url) = db_url.clone() {
+    if let (Some(url), None) = (db_url.clone(), &cfg.wallets_file) {
         // Round two: every wallet a week on trial is checked on its last 7 days, every day.
         let (api, crit) = (api.clone(), cfg.scout_criteria.clone());
         tokio::spawn(async move {

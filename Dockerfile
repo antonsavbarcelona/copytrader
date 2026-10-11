@@ -7,6 +7,8 @@ RUN cargo build --release --locked
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 COPY --from=build /app/target/release/copytrader /usr/local/bin/copytrader
+# The backtest's picks (172 wallets, 90 days to 2026-10-10), copied on paper.
+COPY wallets /app/wallets
 ENV RUST_BACKTRACE=1
 # The state and every event go to Postgres (DATABASE_URL); /data is a local copy.
-CMD ["copytrader", "run", "--data", "/data"]
+CMD ["copytrader", "run", "--data", "/data", "--no-scout", "--wallets-file", "/app/wallets/picks.txt", "--poll-file", "/app/wallets/picks.txt"]
