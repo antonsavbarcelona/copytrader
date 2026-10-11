@@ -70,6 +70,8 @@ async fn refresh_wallets(cfg: &config::Config, api: &api::Api, engine: &engine::
             }
         };
         let listed = set.len();
+        // Buys from the file's wallets only; the others held are followed for their sales.
+        *engine.buyers.lock().await = Some(set.clone());
         set.extend(engine.wallets_held().await);
         let mut w = wallets.write().await;
         let added = set.difference(&w).count();
@@ -113,6 +115,7 @@ async fn refresh_wallets(cfg: &config::Config, api: &api::Api, engine: &engine::
 /// Live: the wallets to copy, the golden list.
 async fn refresh_top(cfg: &config::Config, url: &str, engine: &engine::Engine, wallets: &RwLock<HashSet<String>>) {
     if cfg.wallets_file.is_some() {
+        *engine.buyers.lock().await = Some(HashSet::new());
         let held = engine.wallets_held().await;
         log!("live: no new copies (the paper runs on the wallet file); {} wallets followed for their held lots", held.len());
         *wallets.write().await = held;

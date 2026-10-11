@@ -88,6 +88,9 @@ pub struct Engine {
     pub cash: Mutex<f64>,
     /// Live: markets redeemed by the sweep in this run (the positions API lags behind).
     swept: Mutex<HashSet<String>>,
+    /// The wallets whose buys are copied, when not every wallet followed: the others are
+    /// followed only for the sales of the lots held.
+    pub buyers: Mutex<Option<HashSet<String>>>,
 }
 
 fn fill_json(f: &Fill) -> serde_json::Value {
@@ -129,6 +132,7 @@ impl Engine {
             live,
             cash: Mutex::new(0.0),
             swept: Mutex::new(HashSet::new()),
+            buyers: Mutex::new(None),
         }))
     }
 
@@ -215,6 +219,11 @@ impl Engine {
             }
         }
         if buy {
+            if let Some(b) = &*self.buyers.lock().await {
+                if !b.contains(&t.wallet) {
+                    return;
+                }
+            }
             let mkey = key(&t.wallet, if t.condition.is_empty() { &t.token } else { &t.condition });
             {
                 let mut st = self.state.lock().await;
