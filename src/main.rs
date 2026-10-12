@@ -408,7 +408,13 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         (Some(url), Some(path)) => match allocator::read_prior(path) {
             Ok(prior) => {
                 log!("alloc: prior of {} wallets from {}", prior.len(), path.display());
-                tokio::spawn(allocator::run(url.clone(), api.clone(), prior));
+                // The random books draw from every wallet followed, not only those with a record.
+                let everyone: Vec<String> = match cfg.wallets_file.as_deref().map(read_wallets) {
+                    Some(Ok(set)) => set.into_iter().collect(),
+                    _ => prior.keys().cloned().collect(),
+                };
+                log!("alloc: random books draw from {} wallets", everyone.len());
+                tokio::spawn(allocator::run(url.clone(), api.clone(), prior, everyone));
             }
             Err(e) => log!("alloc: OFF, {} not read: {e}", path.display()),
         },
