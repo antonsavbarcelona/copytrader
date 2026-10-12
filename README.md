@@ -37,6 +37,29 @@ Report on the server's data from anywhere, with the database's public URL:
 DATABASE_URL=postgresql://... target/release/copytrader report
 ```
 
+## What the image runs now: the backtest's wallets and the allocator
+
+The `Dockerfile` runs with `--no-scout --wallets-file wallets/all.txt --poll-file
+wallets/picks.txt --alloc-prior wallets/backtest_stats.csv`:
+
+- The paper copies every wallet in `all.txt` (14,254: active since 2026-09-10 with enough
+  history for the 90-day copy backtest) at $1; the REST read-back reads only `picks.txt`
+  (the backtest's 172 picks), the trade stream sees the rest. Round one and the trials stand
+  still, and live buys nothing new: it only follows its held lots to their sale or the
+  settlement and redeems them.
+- The allocator (`src/allocator.rs`) keeps 72 virtual books over those copies, each with its
+  own $1000: 24 picks (a score - EXPDD, CALMAR, PNL, PNLSQRTN, PF, TSTAT, SHRUNK - of 10, 30
+  or 50 wallets, some only on the bets bought at 0.20-0.50, below 0.95 or below 0.50; and the
+  controls RANDOM_10/30/50 drawn from every wallet, RANDOM_ELIG_30 and ELIGIBLE) times three
+  modes of risk: `W4` (4 copies of a wallet open at most, a copy = $1000 / the book's ceiling
+  of copies open), `W2` (the same at 2) and `1USD` ($1 a copy, no caps). The wallets are
+  ranked daily on the backtest's sums pooled with the paper's closed lots of 30 days.
+  Decisions go to `alloc`, the rankings to `alloc_rank`.
+
+```
+DATABASE_URL=postgresql://... target/release/copytrader alloc    # each book in dollars
+```
+
 ## Round one: the big players
 
 Every 24 h (the first 2 min after the start) the run gathers candidates: the 50 biggest

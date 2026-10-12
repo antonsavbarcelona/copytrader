@@ -23,15 +23,21 @@
 //!
 //! A book is a score, how many wallets (10, 30, 50) and which of their bets: all, MID (bought
 //! at 0.20-0.50), NO95 (below 0.95) or DOG (below 0.50); the backtest's walk-forward found the
-//! edge in the cheaper outcomes. Every book has $1000: its ceiling is the most copies it may
-//! hold open (the backtest's peak with one wallet at 4, plus 30%), and a copy is 1000 / ceiling
-//! dollars, so it never needs more than the deposit. Caps, in copies open: the ceiling, one
-//! wallet 4, one event 3 (a game's winner, spread and total are one bet), and an outcome
-//! another wallet already brought in is not bought again. A wallet that leaves the picks gets
-//! no new copies, but its lots go on to its sale or the settlement. The paper copies at $1; a
-//! book's dollars are its share of those lots times its stake. Each copy a book wanted gets a
-//! row in `alloc` (granted or which cap refused it); `alloc_rank` keeps each day's records
-//! and ranks.
+//! edge in the cheaper outcomes. Each such pick runs in three modes of risk, each a book with
+//! its own $1000:
+//!
+//!     /W4    at most 4 copies of one wallet open; the ceiling is the most copies the book may
+//!            hold open (the backtest's peak at that cap, plus 30%), a copy 1000 / ceiling dollars,
+//!            so it never needs more than the deposit; one event 3 open, and an outcome another
+//!            wallet already brought in is not bought again
+//!     /W2    the same with 2 copies of one wallet: a bigger stake on fewer copies
+//!     /1USD  $1 a copy, no caps: the pick alone, as the paper copies
+//!
+//! A wallet that leaves the picks gets no new copies, but its lots go on to its sale or the
+//! settlement. The paper copies at $1; a book's dollars are its share of those lots times its
+//! stake. Each copy a book wanted gets a row in `alloc` (granted or which cap refused it);
+//! `alloc_rank` keeps each day's records and ranks. The state is saved every 5 minutes; after
+//! a restart the events since are read again and their decisions, already written, kept.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -49,9 +55,9 @@ use crate::log;
 const MIN_N: f64 = 100.0;
 const MIN_ROI: f64 = 0.05;
 const PAPER_DAYS: i32 = 30;
-const WALLET_CAP: f64 = 4.0;
 const EVENT_CAP: f64 = 3.0;
 const DEPOSIT: f64 = 1000.0;
+const SAVE_EVERY_S: f64 = 300.0;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Score {
@@ -87,7 +93,10 @@ impl Bets {
 }
 
 struct Book {
+    /// The pick and mode, as `alloc` names it: PF_30/W4.
     name: String,
+    /// The pick (score, wallets, bets) the modes share.
+    pick: String,
     score: Score,
     n: usize,
     bets: Bets,
@@ -98,44 +107,47 @@ struct Book {
 }
 
 impl Book {
-    /// Dollars a copy: the deposit over the ceiling.
+    /// Dollars a copy: the deposit over the ceiling; $1 with no ceiling.
     fn stake(&self) -> f64 {
-        DEPOSIT / self.total
+        if self.total.is_finite() { DEPOSIT / self.total } else { 1.0 }
+    }
+
+    fn capped(&self) -> bool {
+        self.total.is_finite()
     }
 }
 
 fn books() -> Vec<Book> {
     use Bets::*;
     use Score::*;
-    // name, score, wallets, bets, ceiling (alloc_risk.py: the peak of copies open, lags 7 and 21 days, + 30%)
-    let list: &[(&str, Score, usize, Bets, f64)] = &[
-        ("EXPDD_10", ExpDd, 10, All, 100.0), ("EXPDD_30", ExpDd, 30, All, 190.0), ("EXPDD_50", ExpDd, 50, All, 260.0),
-        ("CALMAR_10", Calmar, 10, All, 70.0), ("CALMAR_30", Calmar, 30, All, 160.0),
-        ("PNL_10", Pnl, 10, All, 80.0), ("PNL_30", Pnl, 30, All, 200.0),
-        ("PNLSQRTN_10", PnlSqrtN, 10, All, 70.0), ("PNLSQRTN_30", PnlSqrtN, 30, All, 200.0),
-        ("PF_30", Pf, 30, All, 220.0), ("PF_50", Pf, 50, All, 310.0),
-        ("TSTAT_30", TStat, 30, All, 250.0),
-        ("SHRUNK_30", Shrunk, 30, All, 190.0),
-        ("PF_MID_30", Pf, 30, Mid, 120.0), ("CALMAR_MID_30", Calmar, 30, Mid, 90.0),
-        ("PF_NO95_30", Pf, 30, No95, 220.0), ("CALMAR_NO95_10", Calmar, 10, No95, 70.0),
-        ("CALMAR_NO95_30", Calmar, 30, No95, 160.0),
-        ("PF_DOG_30", Pf, 30, Dog, 150.0),
-        ("RANDOM_10", RandomAll, 10, All, 140.0), ("RANDOM_30", RandomAll, 30, All, 350.0),
-        ("RANDOM_50", RandomAll, 50, All, 510.0),
-        ("RANDOM_ELIG_30", Random, 30, All, 420.0),
-        ("ELIGIBLE", Eligible, usize::MAX, All, 1240.0),
+    // pick, score, wallets, bets, the ceilings with 2 and 4 copies of a wallet (alloc_risk.py:
+    // the peak of copies open, lags 7 and 21 days, + 30%)
+    let list: &[(&str, Score, usize, Bets, f64, f64)] = &[
+        ("EXPDD_10", ExpDd, 10, All, 50.0, 100.0), ("EXPDD_30", ExpDd, 30, All, 110.0, 190.0),
+        ("EXPDD_50", ExpDd, 50, All, 150.0, 260.0),
+        ("CALMAR_10", Calmar, 10, All, 40.0, 70.0), ("CALMAR_30", Calmar, 30, All, 90.0, 160.0),
+        ("PNL_10", Pnl, 10, All, 40.0, 80.0), ("PNL_30", Pnl, 30, All, 110.0, 200.0),
+        ("PNLSQRTN_10", PnlSqrtN, 10, All, 40.0, 70.0), ("PNLSQRTN_30", PnlSqrtN, 30, All, 110.0, 200.0),
+        ("PF_30", Pf, 30, All, 120.0, 220.0), ("PF_50", Pf, 50, All, 180.0, 310.0),
+        ("TSTAT_30", TStat, 30, All, 130.0, 250.0),
+        ("SHRUNK_30", Shrunk, 30, All, 110.0, 190.0),
+        ("PF_MID_30", Pf, 30, Mid, 80.0, 120.0), ("CALMAR_MID_30", Calmar, 30, Mid, 60.0, 90.0),
+        ("PF_NO95_30", Pf, 30, No95, 120.0, 220.0), ("CALMAR_NO95_10", Calmar, 10, No95, 40.0, 70.0),
+        ("CALMAR_NO95_30", Calmar, 30, No95, 90.0, 160.0),
+        ("PF_DOG_30", Pf, 30, Dog, 90.0, 150.0),
+        ("RANDOM_10", RandomAll, 10, All, 90.0, 140.0), ("RANDOM_30", RandomAll, 30, All, 240.0, 350.0),
+        ("RANDOM_50", RandomAll, 50, All, 360.0, 510.0),
+        ("RANDOM_ELIG_30", Random, 30, All, 240.0, 420.0),
+        ("ELIGIBLE", Eligible, usize::MAX, All, 720.0, 1240.0),
     ];
-    list.iter()
-        .map(|&(name, score, n, bets, ceiling)| Book {
-            name: name.into(),
-            score,
-            n,
-            bets,
-            total: ceiling,
-            wallet: WALLET_CAP,
-            event: EVENT_CAP,
-        })
-        .collect()
+    let inf = f64::INFINITY;
+    let mut out = Vec::new();
+    for &(pick, score, n, bets, c2, c4) in list {
+        for (mode, total, wallet, event) in [("W4", c4, 4.0, EVENT_CAP), ("W2", c2, 2.0, EVENT_CAP), ("1USD", inf, inf, inf)] {
+            out.push(Book { name: format!("{pick}/{mode}"), pick: pick.into(), score, n, bets, total, wallet, event });
+        }
+    }
+    out
 }
 
 /// A record of copies: how many, their cost and result, the winners' and losers' sums, the
@@ -216,6 +228,9 @@ struct State {
     last_id: i64,
     /// The day (unix days) the picks are of.
     day: i64,
+    /// When the state was last saved (not saved itself).
+    #[serde(skip)]
+    saved: f64,
     /// Per book: the wallets it copies.
     picks: HashMap<String, HashMap<String, Pick>>,
     /// Per book: its open lots.
@@ -260,11 +275,12 @@ async fn load(c: &Client) -> Result<State> {
     }
 }
 
-async fn save(c: &Client, s: &State) -> Result<()> {
+async fn save(c: &Client, s: &mut State) -> Result<()> {
+    s.saved = now();
     c.execute(
         "INSERT INTO state (id, saved_at, data) VALUES ('alloc', now(), $1)
          ON CONFLICT (id) DO UPDATE SET saved_at = now(), data = EXCLUDED.data",
-        &[&serde_json::to_value(s)?],
+        &[&serde_json::to_value(&*s)?],
     )
     .await?;
     Ok(())
@@ -315,7 +331,7 @@ async fn step(c: &Client, api: &Api, prior: &HashMap<String, Record>, everyone: 
                     if !b.bets.takes(price) {
                         continue;
                     }
-                    let Some(p) = s.picks.get(&b.name).and_then(|m| m.get(&wallet)).cloned() else { continue };
+                    let Some(p) = s.picks.get(&b.pick).and_then(|m| m.get(&wallet)).cloned() else { continue };
                     let d = decide(b, s, &wallet, &token, &event, cost);
                     decided.push((b.name.clone(), id, wallet.clone(), token.clone(), event.clone(), p, price, cost, d));
                 }
@@ -345,18 +361,25 @@ async fn step(c: &Client, api: &Api, prior: &HashMap<String, Record>, everyone: 
         let stmt = c
             .prepare(
                 "INSERT INTO alloc (at, book, event_id, wallet, token, event, rank, score, price, requested, granted, reason)
-                 VALUES (now(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                 VALUES (now(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (book, event_id) DO NOTHING",
             )
             .await?;
         for (b, id, w, t, e, p, price, cost, d) in &decided {
             c.execute(&stmt, &[b, id, w, t, e, &(p.rank as i32), &p.score, price, cost, &d.granted, &d.reason]).await?;
         }
     }
-    save(c, s).await
+    if now() - s.saved >= SAVE_EVERY_S {
+        save(c, s).await?;
+    }
+    Ok(())
 }
 
 fn decide(b: &Book, s: &mut State, wallet: &str, token: &str, event: &str, cost: f64) -> Decision {
     let no = |reason| Decision { granted: 0.0, reason };
+    if !b.capped() {
+        // No caps: nothing to keep.
+        return Decision { granted: cost, reason: "GRANTED" };
+    }
     let lots = s.lots.entry(b.name.clone()).or_default();
     if lots.iter().any(|l| l.token == token && l.wallet != wallet) {
         return no("DUPLICATE");
@@ -434,14 +457,17 @@ async fn pick(c: &Client, prior: &HashMap<String, Record>, everyone: &[String], 
     let mut ranks: HashMap<String, serde_json::Map<String, Value>> = HashMap::new();
     s.picks.clear();
     for b in books {
+        if s.picks.contains_key(&b.pick) {
+            continue;
+        }
         let mut order: Vec<(&str, f64)> = if b.score == Score::RandomAll {
             everyone.iter().map(|w| (w.as_str(), 0.0)).collect()
         } else {
             pooled.iter().map(|(w, r, _)| (w.as_str(), r.score(b.score))).collect()
         };
         match b.score {
-            Score::RandomAll => order.sort_by_key(|(w, _)| fnv(&format!("{day}{}{w}", b.name))),
-            Score::Random => order.sort_by_key(|(w, _)| fnv(&format!("{day}{}{w}", b.name))),
+            Score::RandomAll => order.sort_by_key(|(w, _)| fnv(&format!("{day}{}{w}", b.pick))),
+            Score::Random => order.sort_by_key(|(w, _)| fnv(&format!("{day}{}{w}", b.pick))),
             Score::Eligible => {}
             _ => order.sort_by(|a, b| b.1.total_cmp(&a.1)),
         }
@@ -453,10 +479,10 @@ async fn pick(c: &Client, prior: &HashMap<String, Record>, everyone: &[String], 
             .collect();
         if b.score != Score::Eligible {
             for (w, p) in &m {
-                ranks.entry(w.clone()).or_default().insert(b.name.clone(), json!(p.rank));
+                ranks.entry(w.clone()).or_default().insert(b.pick.clone(), json!(p.rank));
             }
         }
-        s.picks.insert(b.name.clone(), m);
+        s.picks.insert(b.pick.clone(), m);
     }
     let stmt = c
         .prepare(
@@ -475,8 +501,8 @@ async fn pick(c: &Client, prior: &HashMap<String, Record>, everyone: &[String], 
         c.execute(&stmt, &[&(day as f64), w, &as_json(prior.get(w)), &as_json(paper.get(w)), &rk]).await?;
     }
     s.day = day;
-    log!("alloc: {} eligible ({} with paper lots), {} books picked", pooled.len(),
-        pooled.iter().filter(|x| x.2.is_some()).count(), books.len());
+    log!("alloc: {} eligible ({} with paper lots), {} picks for {} books", pooled.len(),
+        pooled.iter().filter(|x| x.2.is_some()).count(), s.picks.len(), books.len());
     Ok(())
 }
 
@@ -509,8 +535,8 @@ pub async fn report(url: &str) -> Result<()> {
         )
         .await?;
     let stakes: HashMap<String, f64> = books().iter().map(|b| (b.name.clone(), b.stake())).collect();
-    println!("Each book: $1000, a copy = 1000 / its ceiling; the result of closed lots.");
-    println!("{:15} {:>6} {:>7} {:>7} {:>9} {:>8} {:>9} {:>8} {:>7} {:>9}", "book", "$/copy", "copies", "closed", "$ closed", "pnl $",
+    println!("Each book: $1000; W4/W2 a copy = 1000 / its ceiling, 1USD $1 a copy; the result of closed lots.");
+    println!("{:20} {:>6} {:>7} {:>7} {:>9} {:>8} {:>9} {:>8} {:>7} {:>9}", "book", "$/copy", "copies", "closed", "$ closed", "pnl $",
         "balance", "ROI", "wallets", "pnl at $1");
     for r in &rows {
         let (b, n, nc, gc, p, w): (String, i64, i64, Option<f64>, Option<f64>, i64) =
@@ -518,13 +544,13 @@ pub async fn report(url: &str) -> Result<()> {
         let k = stakes.get(&b).copied().unwrap_or(1.0);
         let one = p.unwrap_or(0.0);
         let (gc, p) = (gc.unwrap_or(0.0) * k, one * k);
-        println!("{b:15} {k:6.2} {n:7} {nc:7} {gc:9.2} {p:+8.2} {:9.2} {:+7.2}% {w:7} {one:+9.2}", DEPOSIT + p,
+        println!("{b:20} {k:6.2} {n:7} {nc:7} {gc:9.2} {p:+8.2} {:9.2} {:+7.2}% {w:7} {one:+9.2}", DEPOSIT + p,
             if gc > 0.0 { p / gc * 100.0 } else { 0.0 });
     }
     println!("\nrefused:");
     for r in c.query("SELECT book, reason, count(*) FROM alloc WHERE granted = 0 GROUP BY 1, 2 ORDER BY 1, 3 DESC", &[]).await? {
         let (b, why, n): (String, String, i64) = (r.get(0), r.get(1), r.get(2));
-        println!("  {b:15} {why:13} {n}");
+        println!("  {b:20} {why:13} {n}");
     }
     Ok(())
 }
@@ -535,7 +561,8 @@ mod tests {
 
     #[test]
     fn caps_and_duplicates() {
-        let b = Book { name: "T".into(), score: Score::Pnl, n: 2, bets: Bets::All, total: 4.0, wallet: 2.0, event: 3.0 };
+        let b = Book { name: "T/W2".into(), pick: "T".into(), score: Score::Pnl, n: 2, bets: Bets::All, total: 4.0, wallet: 2.0,
+            event: 3.0 };
         assert_eq!(b.stake(), 250.0);
         let mut s = State::default();
         let r = |s: &mut State, w: &str, t: &str, e: &str| decide(&b, s, w, t, e, 1.0).reason;
@@ -561,6 +588,13 @@ mod tests {
         assert!(Bets::Mid.takes(0.3) && !Bets::Mid.takes(0.1) && !Bets::Mid.takes(0.5));
         assert!(Bets::No95.takes(0.9) && !Bets::No95.takes(0.96));
         assert!(Bets::Dog.takes(0.49) && !Bets::Dog.takes(0.5));
-        assert_eq!(books().len(), 24);
+        assert_eq!(books().len(), 72);
+        let free = books().into_iter().find(|b| b.name == "PF_30/1USD").unwrap();
+        assert_eq!(free.stake(), 1.0);
+        let mut s = State::default();
+        for i in 0..1000 {
+            assert_eq!(decide(&free, &mut s, "a", &format!("t{i}"), "e", 1.0).reason, "GRANTED");
+        }
+        assert!(s.lots.is_empty());
     }
 }

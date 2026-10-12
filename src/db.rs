@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS alloc (
     reason    text NOT NULL
 );
 CREATE INDEX IF NOT EXISTS alloc_book ON alloc (book, wallet, token);
+CREATE UNIQUE INDEX IF NOT EXISTS alloc_once ON alloc (book, event_id);
 CREATE TABLE IF NOT EXISTS alloc_rank (
     day    date NOT NULL,
     wallet text NOT NULL,
