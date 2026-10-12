@@ -16,7 +16,11 @@
 //! point of it, the widest. A score that a short lucky record tops (a ratio: EXPDD, CALMAR,
 //! TSTAT, SHRUNK) gets a long one, 30+ days of the backtest's 90; PF 45+ copies; PNLSQRTN,
 //! which grows with the copies, 15+ days; PNL none (a big profit is a long record already).
-//! EXPDD_ANY_30 is EXPDD with no gate: the gate's control. The scores (higher is better):
+//! EXPDD_ANY_30 is EXPDD with no gate: the gate's control.
+//!
+//! Each pick but RANDOM_10/30/50 and EXPDD_ANY_30 also runs as a twin with the strict gate the
+//! allocator began with (`_STRICT`: 100+ backtest copies at ROI > 5%, the pooled ROI above 0),
+//! so the paper tells the soft gates from the strict. The scores (higher is better):
 //!
 //!     SHRUNK    pnl / (cost + 50)                 ROI, a short record pulled to 0
 //!     EXPDD     (pnl / n) / max(drawdown, 5)      expectancy over drawdown
@@ -61,7 +65,7 @@ use crate::db;
 use crate::log;
 
 /// The rules the picks are made by: when they change, the day's picks are made again.
-const RULES: &str = "a gate for each pick";
+const RULES: &str = "a gate for each pick, strict twins";
 const PAPER_DAYS: i32 = 30;
 const EVENT_CAP: f64 = 3.0;
 const DEPOSIT: f64 = 1000.0;
@@ -80,22 +84,25 @@ enum Score {
     Eligible,
 }
 
-/// A pick's gate: who it may rank, by copies, days with a $100+ bet (of the backtest's 90)
-/// and pooled ROI.
+/// A pick's gate: who it may rank, by the backtest's copies, days with a $100+ bet (of its
+/// 90) and ROI, and the ROI pooled with the paper.
 #[derive(Clone, Copy, PartialEq, Debug)]
 struct Gate {
     n: f64,
     days: f64,
     roi: f64,
+    pooled_roi: f64,
 }
 
 impl Gate {
-    const ANY: Gate = Gate { n: 0.0, days: 0.0, roi: f64::NEG_INFINITY };
+    const ANY: Gate = Gate { n: 0.0, days: 0.0, roi: f64::NEG_INFINITY, pooled_roi: f64::NEG_INFINITY };
     /// Traded long: $100+ bets on 30+ days of the 90.
     const LONG: Gate = Gate { days: 30.0, ..Gate::ANY };
+    /// The allocator's first gate: a long record that made money.
+    const STRICT: Gate = Gate { n: 100.0, roi: 0.05, pooled_roi: 0.0, ..Gate::ANY };
 
-    fn passes(&self, r: &Record) -> bool {
-        r.n >= self.n && r.days >= self.days && r.roi() > self.roi
+    fn passes(&self, prior: &Record, pooled: &Record) -> bool {
+        prior.n >= self.n && prior.days >= self.days && prior.roi() > self.roi && pooled.roi() > self.pooled_roi
     }
 }
 
@@ -172,9 +179,16 @@ fn books() -> Vec<Book> {
     ];
     let inf = f64::INFINITY;
     let mut out = Vec::new();
-    for &(pick, score, gate, n, bets, c2, c4) in list {
+    // The strict twins: the picks with the first gate (their ceilings are of that gate already).
+    let strict: Vec<(String, Score, Gate, usize, Bets, f64, f64)> = list
+        .iter()
+        .filter(|x| x.2 != any || x.1 == Pnl)
+        .map(|&(pick, score, _, n, bets, c2, c4)| (format!("{pick}_STRICT"), score, Gate::STRICT, n, bets, c2, c4))
+        .collect();
+    let all = list.iter().map(|&(p, s, g, n, b, c2, c4)| (p.to_string(), s, g, n, b, c2, c4)).chain(strict);
+    for (pick, score, gate, n, bets, c2, c4) in all {
         for (mode, total, wallet, event) in [("W4", c4, 4.0, EVENT_CAP), ("W2", c2, 2.0, EVENT_CAP), ("1USD", inf, inf, inf)] {
-            out.push(Book { name: format!("{pick}/{mode}"), pick: pick.into(), score, gate, n, bets, total, wallet, event });
+            out.push(Book { name: format!("{pick}/{mode}"), pick: pick.clone(), score, gate, n, bets, total, wallet, event });
         }
     }
     out
@@ -501,13 +515,14 @@ async fn pick(c: &Client, prior: &HashMap<String, Record>, everyone: &[String], 
     pooled.sort_by(|a, b| a.0.cmp(&b.0));
     let mut ranks: HashMap<String, serde_json::Map<String, Value>> = HashMap::new();
     let mut gated = Vec::new();
+    let none = Record::default();
     s.picks.clear();
     for b in books {
         if s.picks.contains_key(&b.pick) {
             continue;
         }
         let mut order: Vec<(&str, f64)> =
-            pooled.iter().filter(|(_, r, _)| b.gate.passes(r)).map(|(w, r, _)| (w.as_str(), r.score(b.score))).collect();
+            pooled.iter().filter(|(w, r, _)| b.gate.passes(prior.get(w).unwrap_or(&none), r)).map(|(w, r, _)| (w.as_str(), r.score(b.score))).collect();
         gated.push(format!("{} {}", b.pick, order.len()));
         match b.score {
             Score::Random => order.sort_by_key(|(w, _)| fnv(&format!("{day}{}{w}", b.pick))),
@@ -578,7 +593,7 @@ pub async fn report(url: &str) -> Result<()> {
         .await?;
     let stakes: HashMap<String, f64> = books().iter().map(|b| (b.name.clone(), b.stake())).collect();
     println!("Each book: $1000; W4/W2 a copy = 1000 / its ceiling, 1USD $1 a copy; the result of closed lots.");
-    println!("{:20} {:>6} {:>7} {:>7} {:>9} {:>8} {:>9} {:>8} {:>7} {:>9}", "book", "$/copy", "copies", "closed", "$ closed", "pnl $",
+    println!("{:28} {:>6} {:>7} {:>7} {:>9} {:>8} {:>9} {:>8} {:>7} {:>9}", "book", "$/copy", "copies", "closed", "$ closed", "pnl $",
         "balance", "ROI", "wallets", "pnl at $1");
     for r in &rows {
         let (b, n, nc, gc, p, w): (String, i64, i64, Option<f64>, Option<f64>, i64) =
@@ -586,13 +601,13 @@ pub async fn report(url: &str) -> Result<()> {
         let Some(&k) = stakes.get(&b) else { continue };
         let one = p.unwrap_or(0.0);
         let (gc, p) = (gc.unwrap_or(0.0) * k, one * k);
-        println!("{b:20} {k:6.2} {n:7} {nc:7} {gc:9.2} {p:+8.2} {:9.2} {:+7.2}% {w:7} {one:+9.2}", DEPOSIT + p,
+        println!("{b:28} {k:6.2} {n:7} {nc:7} {gc:9.2} {p:+8.2} {:9.2} {:+7.2}% {w:7} {one:+9.2}", DEPOSIT + p,
             if gc > 0.0 { p / gc * 100.0 } else { 0.0 });
     }
     println!("\nrefused:");
     for r in c.query("SELECT book, reason, count(*) FROM alloc WHERE granted = 0 GROUP BY 1, 2 ORDER BY 1, 3 DESC", &[]).await? {
         let (b, why, n): (String, String, i64) = (r.get(0), r.get(1), r.get(2));
-        println!("  {b:20} {why:13} {n}");
+        println!("  {b:28} {why:13} {n}");
     }
     Ok(())
 }
@@ -630,9 +645,14 @@ mod tests {
         assert!(Bets::Mid.takes(0.3) && !Bets::Mid.takes(0.1) && !Bets::Mid.takes(0.5));
         assert!(Bets::No95.takes(0.9) && !Bets::No95.takes(0.96));
         assert!(Bets::Dog.takes(0.49) && !Bets::Dog.takes(0.5));
-        assert_eq!(books().len(), 75);
-        assert!(Gate::LONG.passes(&r) && !Gate::LONG.passes(&Record { days: 29.0, ..r }));
-        assert!(Gate::ANY.passes(&Record::default()));
+        assert_eq!(books().len(), 138);
+        assert_eq!(books().iter().filter(|b| b.gate == Gate::STRICT).count(), 63);
+        assert!(books().iter().any(|b| b.name == "PNL_30_STRICT/W4"));
+        assert!(!books().iter().any(|b| b.name.starts_with("RANDOM_10_STRICT") || b.name.starts_with("EXPDD_ANY_30_STRICT")));
+        assert!(Gate::LONG.passes(&r, &r) && !Gate::LONG.passes(&Record { days: 29.0, ..r }, &r));
+        assert!(Gate::ANY.passes(&Record::default(), &Record::default()));
+        assert!(Gate::STRICT.passes(&r, &r) && !Gate::STRICT.passes(&r, &Record { pnl: -1.0, ..r }));
+        assert!(!Gate::STRICT.passes(&Record { pnl: 4.0, ..r }, &r));
         let free = books().into_iter().find(|b| b.name == "PF_30/1USD").unwrap();
         assert_eq!(free.stake(), 1.0);
         let mut s = State::default();

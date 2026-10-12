@@ -47,7 +47,7 @@ wallets/picks.txt --alloc-prior wallets/backtest_stats.csv`:
   (the backtest's 172 picks), the trade stream sees the rest. Round one and the trials stand
   still, and live buys nothing new: it only follows its held lots to their sale or the
   settlement and redeems them.
-- The allocator (`src/allocator.rs`) keeps 75 virtual books over those copies, each with its
+- The allocator (`src/allocator.rs`) keeps 138 virtual books over those copies, each with its
   own $1000: 25 picks (a score - EXPDD, CALMAR, PNL, PNLSQRTN, PF, TSTAT, SHRUNK - of 10, 30
   or 50 wallets, some only on the bets bought at 0.20-0.50, below 0.95 or below 0.50; and the
   controls RANDOM_10/30/50 drawn from every wallet, RANDOM_ELIG_30, ELIGIBLE and EXPDD_ANY_30) times three
@@ -57,6 +57,9 @@ wallets/picks.txt --alloc-prior wallets/backtest_stats.csv`:
   common: each score has its own, chosen by one rule on the walk-forward (the best worst case
   over lags, halves and sizes): EXPDD, CALMAR, TSTAT, SHRUNK $100+ bets on 30+ of the 90 days
   (6,536 wallets), PF 45+ copies (10,153), PNLSQRTN 15+ days (11,042), PNL none (14,254).
+  Each pick but RANDOM_10/30/50 and EXPDD_ANY_30 also has a `_STRICT` twin with the first,
+  strict gate (100+ backtest copies at ROI > 5%, pooled ROI above 0; 955 wallets before the
+  paper): 46 picks in all, to tell soft gates from strict on paper.
   Decisions go to `alloc`, the rankings to `alloc_rank`.
 
 ```
