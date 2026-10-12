@@ -61,8 +61,8 @@ CREATE TABLE IF NOT EXISTS trials (
     last         jsonb,
     weeks        jsonb NOT NULL DEFAULT '[]'
 );
--- The allocator (allocator.rs): each paper copy of an eligible wallet, per book, granted or why
--- not; and each day's ranking.
+-- The allocator (allocator.rs): each paper copy a book wanted, granted or which cap refused it;
+-- and each day's records of the eligible wallets with their rank in each book.
 CREATE TABLE IF NOT EXISTS alloc (
     id        bigserial PRIMARY KEY,
     at        timestamptz NOT NULL,
@@ -73,21 +73,18 @@ CREATE TABLE IF NOT EXISTS alloc (
     event     text,
     rank      int,
     score     float8,
+    price     float8,
     requested float8 NOT NULL,
     granted   float8 NOT NULL,
     reason    text NOT NULL
 );
 CREATE INDEX IF NOT EXISTS alloc_book ON alloc (book, wallet, token);
 CREATE TABLE IF NOT EXISTS alloc_rank (
-    day        date NOT NULL,
-    wallet     text NOT NULL,
-    rank       int NOT NULL,
-    score      float8 NOT NULL,
-    prior_n    float8,
-    prior_roi  float8,
-    paper_n    bigint,
-    paper_cost float8,
-    paper_pnl  float8,
+    day    date NOT NULL,
+    wallet text NOT NULL,
+    prior  jsonb,
+    paper  jsonb,
+    ranks  jsonb NOT NULL,
     PRIMARY KEY (day, wallet)
 );
 CREATE OR REPLACE VIEW buys AS

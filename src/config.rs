@@ -37,7 +37,7 @@ pub struct Config {
     /// The REST read-back reads only the wallets in this file (with thousands followed, a round
     /// of all would take hours; the stream sees every trade anyway).
     pub poll_file: Option<PathBuf>,
-    /// The allocator's prior, the backtest's CSV (wallet,n,roi,style); with it the allocator's
+    /// The allocator's prior, the backtest's per wallet sums (wallet,n,cost,pnl,win,loss,r2,dd); with it its
     /// books run next to the paper (allocator.rs).
     pub alloc_prior: Option<PathBuf>,
     /// Real orders (live.rs) instead of paper fills, events to their own tables.

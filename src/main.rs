@@ -25,7 +25,7 @@
 //! nothing else: the trials stand still, and live buys nothing new, only follows its held lots
 //! to their sale or settlement and redeems them.
 //!
-//! With --alloc-prior (the backtest's CSV) the allocator (allocator.rs) ranks the wallets daily
+//! With --alloc-prior (the backtest's per wallet sums) the allocator (allocator.rs) ranks the wallets daily
 //! and keeps virtual portfolios over the paper's copies: which wallets to copy, and how much.
 
 mod allocator;
