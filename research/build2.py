@@ -2,11 +2,9 @@
 
 order   the wallet's fills of one outcome within ORDER_S of the first (what the copier has seen
         by the time its own order lands); its size is their sum
-copy    the paper's rule: one copy per wallet and market in 6 h, except that a window a small
-        order opened does not hold back a big one (the engine waits for the order's pieces)
-book    takes only the copies of orders of MIN_BET+ (the trader's own money on it)
+copy    the paper's rule: one copy per wallet and market in 6 h
 
-py build2.py WALLETS_FILE -> rows2.pkl (every big copy of every wallet) and prior2.csv (per
+py build2.py WALLETS_FILE -> rows2.pkl (every copy of every wallet) and prior2.csv (per
 wallet sums, the columns the allocator reads: wallets/backtest_stats.csv)."""
 import os, pickle, sys
 import numpy as np, pandas as pd
@@ -14,7 +12,7 @@ from multiprocessing import Pool
 import sim
 
 NOW = 1791676800; START = NOW - 90 * 86400
-ORDER_S, GAP, MIN_BET = 2, 6 * 3600, 100.0
+ORDER_S, GAP = 2, 6 * 3600
 final = None
 
 
@@ -25,20 +23,19 @@ def init():
 
 def simulate(trades, haircut=0.022):
     ds = sim.decisions(trades, ORDER_S)
-    win = {}   # cond -> (time the window opened, opened by a big order)
+    win = {}   # cond -> when the window opened
     pos, ours, rows = {}, {}, []
     for d in ds:
         tok = d['token']
         if d['side'] == 'BUY':
             pos[tok] = pos.get(tok, 0.0) + d['shares']
-            big = d['usd'] >= MIN_BET
             w = win.get(d['cond'])
-            if w and d['t0'] - w[0] <= GAP and (w[1] or not big):
+            if w is not None and d['t0'] - w <= GAP:
                 continue
-            win[d['cond']] = (d['t0'], big)
+            win[d['cond']] = d['t0']
             p = min(d['p0'] + sim.SLIP, 0.999)
             rows.append(dict(t0=d['t0'], token=tok, cond=d['cond'], title=d['title'], slug=d['slug'], p0=d['p0'],
-                             usd=d['usd'], big=big, cost=1.0 + sim.fee(p), back=0.0, left=1.0 / p, hold=None))
+                             usd=d['usd'], cost=1.0 + sim.fee(p), back=0.0, left=1.0 / p, hold=None))
             ours.setdefault(tok, []).append(len(rows) - 1)
         else:
             held = pos.get(tok, 0.0)
@@ -56,8 +53,6 @@ def simulate(trades, haircut=0.022):
                     r['hold'] = d['t0'] - r['t0']
     out = []
     for r in rows:
-        if not r['big']:
-            continue
         f = final.get(r['token'])
         r['settled'] = f is not None and f[1]
         if r['left'] > 1e-9:

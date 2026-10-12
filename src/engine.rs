@@ -8,11 +8,8 @@
 //!          executor's single retry). A miss is also priced uncapped ("shadow"), to see what
 //!          the cap saved or cost.
 //!   once   one buy per wallet and market in `market_gap_s` (pieces of one order within
-//!          `join_s` are one trade; wallets looping both sides of a market take one copy),
-//!          except that a window a small order (under `BIG_ORDER` dollars) opened does not hold
-//!          back a big one: a buy there waits `ORDER_S` for its pieces and is copied if they
-//!          add up to `BIG_ORDER`. Each buy event keeps the order's dollars seen by then
-//!          (`wallet_usd`): the allocator's books copy only the big ones.
+//!          `join_s` are one trade; wallets looping both sides of a market take one copy).
+//!          Each buy event keeps the trader's order in dollars seen by then (`wallet_usd`).
 //!   late   a buy first seen over REST more than `rest_max_age_s` after the trade is a miss.
 //!   sell   when the wallet sells an outcome we hold for it: the share it sold (from its
 //!          position after the sale), then once the positions API has caught up
@@ -47,9 +44,6 @@ use crate::live::Live;
 use crate::log;
 use crate::stream::{Seen, Source};
 
-/// A trader's order of this many dollars is a real bet (the allocator's books copy only these;
-/// its prior, the backtest, counted only these).
-pub const BIG_ORDER: f64 = 100.0;
 /// The pieces of an order that count to its size: within this many seconds of the first (what
 /// the copier has seen by the time its own order lands).
 pub const ORDER_S: f64 = 2.0;
@@ -69,9 +63,6 @@ pub struct State {
     pub lots: HashMap<String, Lot>,
     /// "wallet|condition" -> when a buy was last copied there.
     pub market_copied: HashMap<String, f64>,
-    /// The "wallet|condition" windows a small order opened: a big one is still copied there.
-    #[serde(default)]
-    pub small_windows: HashSet<String>,
     /// "wallet|token" -> the most the wallet was seen holding.
     pub their_peak: HashMap<String, f64>,
     /// "wallet|token" -> the most we held for it.
@@ -172,9 +163,8 @@ impl Engine {
         let json = {
             let mut st = self.state.lock().await;
             st.lots.retain(|_, l| l.shares > 1e-6);
-            let State { lots, market_copied, small_windows, their_peak, our_peak } = &mut *st;
+            let State { lots, market_copied, their_peak, our_peak } = &mut *st;
             market_copied.retain(|_, at| t - *at <= self.cfg.market_gap_s + 3600.0);
-            small_windows.retain(|k| market_copied.contains_key(k));
             their_peak.retain(|k, _| lots.contains_key(k));
             our_peak.retain(|k, _| lots.contains_key(k));
             serde_json::to_string(&*st)
@@ -251,42 +241,17 @@ impl Engine {
                 }
             }
             let mkey = key(&t.wallet, if t.condition.is_empty() { &t.token } else { &t.condition });
-            let wait = {
+            {
                 let mut st = self.state.lock().await;
                 match st.market_copied.get(&mkey) {
-                    Some(at) if t.ts - at <= self.cfg.market_gap_s && t.ts >= *at - 60.0 => {
-                        if !st.small_windows.contains(&mkey) {
-                            return;
-                        }
-                        // A small order opened this window: copied only if this one is big.
-                        true
-                    }
+                    Some(at) if t.ts - at <= self.cfg.market_gap_s && t.ts >= *at - 60.0 => return,
                     _ => {
-                        st.market_copied.insert(mkey.clone(), t.ts);
-                        false
-                    }
-                }
-            };
-            self.pending.lock().await.insert(pkey, t.ts);
-            self.orders.lock().await.insert((t.wallet.clone(), t.token.clone()), (t.ts, t.size * t.price));
-            if wait {
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_secs_f64(ORDER_S + 0.5)).await;
-                    let t = &seen.trade;
-                    let usd = self.order_usd(&t.wallet, &t.token).await;
-                    {
-                        let mut st = self.state.lock().await;
-                        if usd < BIG_ORDER || !st.small_windows.remove(&mkey) {
-                            return;
-                        }
                         st.market_copied.insert(mkey, t.ts);
                     }
-                    let me = self.clone();
-                    let _p = self.limit.acquire().await;
-                    me.copy_buy(seen).await;
-                });
-                return;
+                }
             }
+            self.pending.lock().await.insert(pkey, t.ts);
+            self.orders.lock().await.insert((t.wallet.clone(), t.token.clone()), (t.ts, t.size * t.price));
             if seen.source == Source::Rest && seen.recv - t.ts > self.cfg.rest_max_age_s {
                 // Our stream missed it: the live executor would have been too late as well.
                 self.write(json!({"kind": "buy", "wallet": t.wallet, "token": t.token, "condition": t.condition,
@@ -404,17 +369,8 @@ impl Engine {
             *peak = peak.max(held);
         }
         let vs = f.avg().map(|p| round((p / t.price - 1.0) * 1e4, 1));
-        // The order's size by now; a small one leaves its market's window open to a big one.
+        // The trader's order in dollars seen by now.
         let wallet_usd = self.order_usd(&t.wallet, &t.token).await;
-        {
-            let mkey = key(&t.wallet, if t.condition.is_empty() { &t.token } else { &t.condition });
-            let mut st = self.state.lock().await;
-            if wallet_usd < BIG_ORDER {
-                st.small_windows.insert(mkey);
-            } else {
-                st.small_windows.remove(&mkey);
-            }
-        }
         log!("{} BUY {:.3} -> {} {}", &t.wallet[..10], t.price,
             if filled { format!("filled ${:.2} @ {:.3} ({:+.0} bps)", f.usd, f.avg().unwrap_or(0.0), vs.unwrap_or(0.0)) }
             else if missed == "cap" { format!("missed (cap {cap})") } else { format!("missed ({missed}) {order}") },

@@ -53,29 +53,28 @@ wallets/picks.txt --alloc-prior wallets/backtest_stats.csv`:
 
 ### The allocator's books
 
-**What a book copies.** Only a trader's real bets: orders of $100+ (`BIG_ORDER`; an order is
-the trader's fills of one outcome within 2 s, what the copier has seen when its own order
-lands; the event keeps it as `wallet_usd`). The prior, the backtest's per wallet sums, counts
-the same copies by the same rule (`research/build2.py`), so a wallet is ranked on the bets the
-book copies. The paper still copies every buy at $1 (one per wallet and market in 6 h), but a
-window a small order opened does not hold back a big one: the engine waits 2 s for its pieces.
+**What a book copies.** Every buy the paper copied of the wallets it picked (one per wallet and
+market in 6 h), whatever the trader's size; the event keeps the trader's order in dollars (its
+fills of one outcome within 2 s) as `wallet_usd`. The prior, the backtest's per wallet sums,
+counts copies by the same rule (`research/build2.py`), so a wallet is ranked on what the book
+copies.
 
 **Who a book copies.** No filter is common. Each pick has its own gate (a minimum record),
 ranks the wallets through it by its score, daily, on the prior pooled with the paper's closed
 lots of 30 days, and takes its top N. One rule chose each score's gate (`research/`): of nine
 gates, the one with the best worst result over lags 7 and 21 days, both halves of the period
-and top 10 and 30; within a point of it, the widest. The gates, of 14,224 wallets:
+and top 10 and 30; within a point of it, the widest. The gates, of 14,254 wallets:
 
 | score | gate | wallets |
 |---|---|---|
-| EXPDD, TSTAT, PNL, PNLSQRTN | $100+ bets on 30+ of the backtest's 90 days | 6,193 |
-| PF | 45+ copies | 9,089 |
-| CALMAR, SHRUNK | none | 14,224 |
+| EXPDD, TSTAT, PNL, PNLSQRTN | bets on 30+ of the backtest's 90 days | 9,038 |
+| PF | 45+ copies | 12,520 |
+| CALMAR, SHRUNK | none | 14,254 |
 
-EXPDD, TSTAT and PF chose the same gate on both versions of the backtest; for the others it
-changed, i.e. their gate hardly matters. Each pick but the random ones and EXPDD_ANY_30 also
+The gates were chosen on the backtest of orders of $100+ and kept when the books went back to
+copying every buy. Each pick but the random ones and EXPDD_ANY_30 also
 runs as a `_STRICT` twin with the allocator's first gate (100+ copies at ROI > 5%, pooled ROI
-above 0; 472 wallets): soft against strict on paper.
+above 0; up to 1,189 wallets): soft against strict on paper.
 
 The picks: EXPDD 10/30/50, CALMAR 10/30, PNL 10/30, PNLSQRTN 10/30, PF 30/50, TSTAT 30, SHRUNK 30,
 on the bets bought at 0.20-0.50 PF_MID_30 and CALMAR_MID_30, below 0.95 PF_NO95_30 and

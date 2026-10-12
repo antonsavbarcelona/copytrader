@@ -2,8 +2,7 @@
 //!
 //! The paper copies every wallet followed at $1 (engine.rs). On top of it, virtual portfolios
 //! ("books") each take only some of those copies: of the wallets their score ranks best, the
-//! real bets (orders of $100+, `BIG_ORDER`, as the prior counts them) that their price filter
-//! lets through, inside their caps. A book's copy fills as the paper's did
+//! buys that their price filter lets through, inside their caps. A book's copy fills as the paper's did
 //! (at $1 the size does not move the price), so its result is the paper lots it took. Nothing
 //! here trades: the books run side by side so the paper shows which score picks best.
 //!
@@ -11,10 +10,10 @@
 //! sums) pooled with the paper's lots closed in the last 30 days. Nothing is filtered for all:
 //! each pick has its own gate, then ranks who passes it by its score and takes the top N.
 //!
-//! A gate is a minimum record (copies or days with a $100+ bet), and one rule chose each
+//! A gate is a minimum record (copies or days with a bet), and one rule chose each
 //! score's (research/gate_pick.py, on the walk-forward of nine gates): the gate whose worst
 //! result (lags 7 and 21 days, first and second half, top 10 and 30) is best; within 1 point
-//! of it, the widest. EXPDD, TSTAT, PNL and PNLSQRTN rank wallets with $100+ bets on 30+ days
+//! of it, the widest. EXPDD, TSTAT, PNL and PNLSQRTN rank wallets with bets on 30+ days
 //! of the backtest's 90, PF those with 45+ copies, CALMAR and SHRUNK every wallet.
 //! EXPDD_ANY_30 is EXPDD with no gate: the gate's control.
 //!
@@ -64,11 +63,10 @@ use tokio_postgres::Client;
 
 use crate::api::{Api, now};
 use crate::db;
-use crate::engine::BIG_ORDER;
 use crate::log;
 
 /// The rules the picks are made by: when they change, the day's picks are made again.
-const RULES: &str = "a gate for each pick, strict twins; orders of $100+; prior v2";
+const RULES: &str = "a gate for each pick, strict twins; every order; prior v2";
 const PAPER_DAYS: i32 = 30;
 const EVENT_CAP: f64 = 3.0;
 const DEPOSIT: f64 = 1000.0;
@@ -88,7 +86,7 @@ enum Score {
     Eligible,
 }
 
-/// A pick's gate: who it may rank, by the backtest's copies, days with a $100+ bet (of its
+/// A pick's gate: who it may rank, by the backtest's copies, days with a bet (of its
 /// 90) and ROI, and the ROI pooled with the paper.
 #[derive(Clone, Copy, PartialEq, Debug)]
 struct Gate {
@@ -100,7 +98,7 @@ struct Gate {
 
 impl Gate {
     const ANY: Gate = Gate { n: 0.0, days: 0.0, roi: f64::NEG_INFINITY, pooled_roi: f64::NEG_INFINITY };
-    /// Traded long: $100+ bets on 30+ days of the 90.
+    /// Traded long: bets on 30+ days of the 90.
     const LONG: Gate = Gate { days: 30.0, ..Gate::ANY };
     /// The allocator's first gate: a long record that made money.
     const STRICT: Gate = Gate { n: 100.0, roi: 0.05, pooled_roi: 0.0, ..Gate::ANY };
@@ -402,9 +400,7 @@ async fn step(c: &Client, api: &Api, prior: &HashMap<String, Record>, everyone: 
                 let fill = &data["fill"];
                 let cost = fill["usd"].as_f64().unwrap_or(0.0) + fill["fee"].as_f64().unwrap_or(0.0);
                 let price = data["wallet_price"].as_f64().unwrap_or(0.0);
-                // The trader's order in dollars (before the engine kept it: its first piece).
-                let bet = data["wallet_usd"].as_f64().unwrap_or_else(|| data["wallet_size"].as_f64().unwrap_or(0.0) * price);
-                if cost <= 0.0 || bet < BIG_ORDER || !wanted.contains(&wallet) {
+                if cost <= 0.0 || !wanted.contains(&wallet) {
                     continue;
                 }
                 let event = match api.market(&token, 7.0 * 86400.0).await {
@@ -493,8 +489,7 @@ fn decide(b: &Book, s: &mut State, wallet: &str, token: &str, event: &str, cost:
     Decision { granted: cost, reason: "GRANTED" }
 }
 
-/// The paper's lots closed in the last 30 days of orders of $100+ (as the prior counts), per
-/// wallet, as a record.
+/// The paper's lots closed in the last 30 days, per wallet, as a record.
 async fn paper_records(c: &Client) -> Result<HashMap<String, Record>> {
     let rows = c
         .query(
@@ -503,15 +498,13 @@ async fn paper_records(c: &Client) -> Result<HashMap<String, Record>> {
                  sum(CASE WHEN kind = 'buy' THEN coalesce((data->'fill'->>'usd')::float8, 0) + coalesce((data->'fill'->>'fee')::float8, 0) ELSE 0 END) AS cost,
                  sum(CASE WHEN kind = 'sell' THEN coalesce((data->'fill'->>'usd')::float8, 0) - coalesce((data->'fill'->>'fee')::float8, 0)
                           WHEN kind = 'settle' THEN (data->>'usd')::float8 ELSE 0 END) AS back,
-                 bool_or(kind = 'settle' OR (kind = 'sell' AND (data->>'held_after')::float8 < 1e-6)) AS closed,
-                 bool_or(kind = 'buy' AND coalesce((data->>'wallet_usd')::float8,
-                         (data->>'wallet_size')::float8 * (data->>'wallet_price')::float8) >= $2) AS big
+                 bool_or(kind = 'settle' OR (kind = 'sell' AND (data->>'held_after')::float8 < 1e-6)) AS closed
                FROM events WHERE at > now() - make_interval(days => $1) AND wallet IS NOT NULL
                GROUP BY 1, 2)
              SELECT wallet, count(*)::float8, sum(cost), sum(back - cost), sum(greatest(back - cost, 0)),
                     sum(greatest(cost - back, 0)), sum(((back - cost) / cost) ^ 2)
-             FROM k WHERE closed AND big AND cost > 0 GROUP BY 1",
-            &[&PAPER_DAYS, &BIG_ORDER],
+             FROM k WHERE closed AND cost > 0 GROUP BY 1",
+            &[&PAPER_DAYS],
         )
         .await?;
     Ok(rows
@@ -808,7 +801,7 @@ pub async fn report(url: &str) -> Result<()> {
     }
     let max_dd = |b: &str| dd.get(b).map(|x| x.1).unwrap_or(0.0);
 
-    println!("Since {} UTC ({days:.1} days), the rules \"{RULES}\": copies of trader orders of ${BIG_ORDER}+.",
+    println!("Since {} UTC ({days:.1} days), the rules \"{RULES}\".",
         fmt_time(since));
     println!("$1000 a book; W4/W2 a copy = 1000 / its ceiling, 1USD $1 a copy. ROI: the closed lots, [95% bounds],");
     println!("first half / second half by close; pnl and balance: open lots at today's price; dd: the worst drop.\n");
