@@ -294,6 +294,9 @@ struct Decision {
     reason: &'static str,
 }
 
+/// A decision as `alloc` keeps it: book, paper event, wallet, token, event, pick, price, cost.
+type Decided = (String, i64, String, String, String, Pick, f64, f64, Decision);
+
 async fn step(c: &Client, api: &Api, prior: &HashMap<String, Record>, everyone: &[String], books: &[Book], s: &mut State)
     -> Result<()> {
     let day = (now() / 86400.0) as i64;
@@ -312,7 +315,7 @@ async fn step(c: &Client, api: &Api, prior: &HashMap<String, Record>, everyone: 
         return Ok(());
     }
     let wanted: HashSet<String> = s.picks.values().flat_map(|m| m.keys().cloned()).collect();
-    let mut decided = Vec::new();
+    let mut decided: Vec<Decided> = Vec::new();
     for r in &rows {
         let (id, kind, data): (i64, String, Value) = (r.get(0), r.get(1), r.get(4));
         let wallet: String = r.get::<_, Option<String>>(2).unwrap_or_default();
@@ -361,15 +364,22 @@ async fn step(c: &Client, api: &Api, prior: &HashMap<String, Record>, everyone: 
         }
     }
     if !decided.is_empty() {
-        let stmt = c
-            .prepare(
-                "INSERT INTO alloc (at, book, event_id, wallet, token, event, rank, score, price, requested, granted, reason)
-                 VALUES (now(), $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) ON CONFLICT (book, event_id) DO NOTHING",
-            )
-            .await?;
-        for (b, id, w, t, e, p, price, cost, d) in &decided {
-            c.execute(&stmt, &[b, id, w, t, e, &(p.rank as i32), &p.score, price, cost, &d.granted, &d.reason]).await?;
-        }
+        // One statement for all: the database is a round trip away.
+        let col = |f: &dyn Fn(&Decided) -> String| decided.iter().map(f).collect::<Vec<String>>();
+        let num = |f: &dyn Fn(&Decided) -> f64| decided.iter().map(f).collect::<Vec<f64>>();
+        let (books, wallets, tokens, events, reasons) =
+            (col(&|x| x.0.clone()), col(&|x| x.2.clone()), col(&|x| x.3.clone()), col(&|x| x.4.clone()), col(&|x| x.8.reason.into()));
+        let ids: Vec<i64> = decided.iter().map(|x| x.1).collect();
+        let ranks: Vec<i32> = decided.iter().map(|x| x.5.rank as i32).collect();
+        let (scores, prices, costs, granted) = (num(&|x| x.5.score), num(&|x| x.6), num(&|x| x.7), num(&|x| x.8.granted));
+        c.execute(
+            "INSERT INTO alloc (at, book, event_id, wallet, token, event, rank, score, price, requested, granted, reason)
+             SELECT now(), * FROM unnest($1::text[], $2::int8[], $3::text[], $4::text[], $5::text[], $6::int4[], $7::float8[],
+                                         $8::float8[], $9::float8[], $10::float8[], $11::text[])
+             ON CONFLICT (book, event_id) DO NOTHING",
+            &[&books, &ids, &wallets, &tokens, &events, &ranks, &scores, &prices, &costs, &granted, &reasons],
+        )
+        .await?;
     }
     if now() - s.saved >= SAVE_EVERY_S {
         save(c, s).await?;
@@ -487,23 +497,23 @@ async fn pick(c: &Client, prior: &HashMap<String, Record>, everyone: &[String], 
         }
         s.picks.insert(b.pick.clone(), m);
     }
-    let stmt = c
-        .prepare(
-            "INSERT INTO alloc_rank (day, wallet, prior, paper, ranks)
-             VALUES (to_timestamp($1::float8 * 86400)::date, $2, $3, $4, $5)
-             ON CONFLICT (day, wallet) DO UPDATE SET prior = EXCLUDED.prior, paper = EXCLUDED.paper, ranks = EXCLUDED.ranks",
-        )
-        .await?;
     // The eligible, and the wallets only a random draw of everyone picked.
     let as_json = |r: Option<&Record>| r.map(|r| json!(r)).unwrap_or(Value::Null);
     let mut rows: Vec<&String> = pooled.iter().map(|x| &x.0).collect();
     let listed: HashSet<&String> = rows.iter().copied().collect();
     let extra: Vec<&String> = ranks.keys().filter(|w| !listed.contains(w)).collect();
     rows.extend(extra);
-    for w in rows {
-        let rk = Value::Object(ranks.get(w).cloned().unwrap_or_default());
-        c.execute(&stmt, &[&(day as f64), w, &as_json(prior.get(w)), &as_json(paper.get(w)), &rk]).await?;
-    }
+    let wallets: Vec<String> = rows.iter().map(|w| w.to_string()).collect();
+    let priors: Vec<Value> = rows.iter().map(|w| as_json(prior.get(*w))).collect();
+    let papers: Vec<Value> = rows.iter().map(|w| as_json(paper.get(*w))).collect();
+    let rks: Vec<Value> = rows.iter().map(|w| Value::Object(ranks.get(*w).cloned().unwrap_or_default())).collect();
+    c.execute(
+        "INSERT INTO alloc_rank (day, wallet, prior, paper, ranks)
+         SELECT to_timestamp($1::float8 * 86400)::date, * FROM unnest($2::text[], $3::jsonb[], $4::jsonb[], $5::jsonb[])
+         ON CONFLICT (day, wallet) DO UPDATE SET prior = EXCLUDED.prior, paper = EXCLUDED.paper, ranks = EXCLUDED.ranks",
+        &[&(day as f64), &wallets, &priors, &papers, &rks],
+    )
+    .await?;
     s.day = day;
     s.rules = RULES.to_string();
     log!("alloc: {} eligible ({} with paper lots), {} picks for {} books", pooled.len(),
