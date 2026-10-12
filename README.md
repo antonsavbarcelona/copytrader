@@ -53,7 +53,8 @@ wallets/picks.txt --alloc-prior wallets/backtest_stats.csv`:
   controls RANDOM_10/30/50 drawn from every wallet, RANDOM_ELIG_30 and ELIGIBLE) times three
   modes of risk: `W4` (4 copies of a wallet open at most, a copy = $1000 / the book's ceiling
   of copies open), `W2` (the same at 2) and `1USD` ($1 a copy, no caps). The wallets are
-  ranked daily on the backtest's sums pooled with the paper's closed lots of 30 days.
+  ranked daily on the backtest's sums pooled with the paper's closed lots of 30 days; any wallet
+  that has traded long ($100+ bets on 30+ of the backtest's 90 days, 6,536 of them) can be picked.
   Decisions go to `alloc`, the rankings to `alloc_rank`.
 
 ```

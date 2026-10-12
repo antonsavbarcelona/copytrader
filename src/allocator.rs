@@ -7,8 +7,9 @@
 //! here trades: the books run side by side so the paper shows which score picks best.
 //!
 //! Each day every wallet's record is the 90-day backtest (the prior, a file of per wallet
-//! sums) pooled with the paper's lots closed in the last 30 days. Eligible: 100+ backtest
-//! copies at ROI > 5% whose pooled ROI stays above 0. The scores (higher is better):
+//! sums) pooled with the paper's lots closed in the last 30 days. Eligible: a wallet that has
+//! traded long, not a new one: $100+ bets on 30+ days of the backtest's 90, any style, any
+//! result; the scores pick among them (higher is better):
 //!
 //!     SHRUNK    pnl / (cost + 50)                 ROI, a short record pulled to 0
 //!     EXPDD     (pnl / n) / max(drawdown, 5)      expectancy over drawdown
@@ -52,8 +53,10 @@ use crate::api::{Api, now};
 use crate::db;
 use crate::log;
 
-const MIN_N: f64 = 100.0;
-const MIN_ROI: f64 = 0.05;
+/// Days (of the backtest's 90) with a $100+ bet: a wallet that has traded long.
+const MIN_DAYS: f64 = 30.0;
+/// The rules the picks are made by: when they change, the day's picks are made again.
+const RULES: &str = "eligible: 30+ days";
 const PAPER_DAYS: i32 = 30;
 const EVENT_CAP: f64 = 3.0;
 const DEPOSIT: f64 = 1000.0;
@@ -151,7 +154,7 @@ fn books() -> Vec<Book> {
 }
 
 /// A record of copies: how many, their cost and result, the winners' and losers' sums, the
-/// sum of squared returns and the worst drawdown of the running result.
+/// sum of squared returns, the worst drawdown of the running result, and on how many days.
 #[derive(Clone, Copy, Default, Serialize, Deserialize, Debug)]
 pub struct Record {
     n: f64,
@@ -161,13 +164,11 @@ pub struct Record {
     loss: f64,
     r2: f64,
     dd: f64,
+    #[serde(default)]
+    days: f64,
 }
 
 impl Record {
-    fn roi(&self) -> f64 {
-        if self.cost > 0.0 { self.pnl / self.cost } else { 0.0 }
-    }
-
     fn score(&self, s: Score) -> f64 {
         let n = self.n.max(1.0);
         let mean = self.pnl / n;
@@ -185,22 +186,22 @@ impl Record {
     }
 }
 
-/// The backtest's per wallet sums (CSV: wallet,n,cost,pnl,win,loss,r2,dd,...).
+/// The backtest's per wallet sums (CSV: wallet,n,cost,pnl,win,loss,r2,dd,days,...).
 pub fn read_prior(path: &Path) -> Result<HashMap<String, Record>> {
     let text = std::fs::read_to_string(path)?;
     let mut lines = text.lines();
     let head: Vec<&str> = lines.next().unwrap_or_default().split(',').collect();
     let col = |k: &str| head.iter().position(|h| h.trim() == k).ok_or_else(|| anyhow::anyhow!("no column {k}"));
-    let (w, n, cost, pnl, win, loss, r2, dd) =
-        (col("wallet")?, col("n")?, col("cost")?, col("pnl")?, col("win")?, col("loss")?, col("r2")?, col("dd")?);
+    let (w, n, cost, pnl, win, loss, r2, dd, days) = (col("wallet")?, col("n")?, col("cost")?, col("pnl")?, col("win")?,
+        col("loss")?, col("r2")?, col("dd")?, col("days")?);
     let mut out = HashMap::new();
     for l in lines {
         let f: Vec<&str> = l.split(',').collect();
         let v = |i: usize| f.get(i).and_then(|x| x.trim().parse::<f64>().ok());
-        if let (Some(n), Some(cost), Some(pnl), Some(win), Some(loss), Some(r2), Some(dd)) =
-            (v(n), v(cost), v(pnl), v(win), v(loss), v(r2), v(dd))
+        if let (Some(n), Some(cost), Some(pnl), Some(win), Some(loss), Some(r2), Some(dd), Some(days)) =
+            (v(n), v(cost), v(pnl), v(win), v(loss), v(r2), v(dd), v(days))
         {
-            out.insert(f[w].trim().to_lowercase(), Record { n, cost, pnl, win, loss, r2, dd });
+            out.insert(f[w].trim().to_lowercase(), Record { n, cost, pnl, win, loss, r2, dd, days });
         }
     }
     Ok(out)
@@ -226,8 +227,10 @@ struct Lot {
 struct State {
     /// The last paper event read.
     last_id: i64,
-    /// The day (unix days) the picks are of.
+    /// The day (unix days) the picks are of, and the rules they were made by.
     day: i64,
+    #[serde(default)]
+    rules: String,
     /// When the state was last saved (not saved itself).
     #[serde(skip)]
     saved: f64,
@@ -294,7 +297,7 @@ struct Decision {
 async fn step(c: &Client, api: &Api, prior: &HashMap<String, Record>, everyone: &[String], books: &[Book], s: &mut State)
     -> Result<()> {
     let day = (now() / 86400.0) as i64;
-    if s.day != day {
+    if s.day != day || s.rules != RULES {
         pick(c, prior, everyone, books, s, day).await?;
         save(c, s).await?;
     }
@@ -424,7 +427,8 @@ async fn paper_records(c: &Client) -> Result<HashMap<String, Record>> {
         .iter()
         .map(|r| {
             let pnl: f64 = r.get(3);
-            let rec = Record { n: r.get(1), cost: r.get(2), pnl, win: r.get(4), loss: r.get(5), r2: r.get(6), dd: (-pnl).max(0.0) };
+            let rec = Record { n: r.get(1), cost: r.get(2), pnl, win: r.get(4), loss: r.get(5), r2: r.get(6), dd: (-pnl).max(0.0),
+                days: 0.0 };
             (r.get(0), rec)
         })
         .collect())
@@ -436,7 +440,7 @@ async fn pick(c: &Client, prior: &HashMap<String, Record>, everyone: &[String], 
     let paper = paper_records(c).await?;
     let mut pooled: Vec<(String, Record, Option<Record>)> = prior
         .iter()
-        .filter(|(_, p)| p.n >= MIN_N && p.roi() > MIN_ROI)
+        .filter(|(_, p)| p.days >= MIN_DAYS)
         .map(|(w, p)| {
             let q = paper.get(w).copied();
             let mut r = *p;
@@ -451,7 +455,6 @@ async fn pick(c: &Client, prior: &HashMap<String, Record>, everyone: &[String], 
             }
             (w.clone(), r, q)
         })
-        .filter(|(_, r, _)| r.roi() > 0.0)
         .collect();
     pooled.sort_by(|a, b| a.0.cmp(&b.0));
     let mut ranks: HashMap<String, serde_json::Map<String, Value>> = HashMap::new();
@@ -487,7 +490,8 @@ async fn pick(c: &Client, prior: &HashMap<String, Record>, everyone: &[String], 
     let stmt = c
         .prepare(
             "INSERT INTO alloc_rank (day, wallet, prior, paper, ranks)
-             VALUES (to_timestamp($1::float8 * 86400)::date, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+             VALUES (to_timestamp($1::float8 * 86400)::date, $2, $3, $4, $5)
+             ON CONFLICT (day, wallet) DO UPDATE SET prior = EXCLUDED.prior, paper = EXCLUDED.paper, ranks = EXCLUDED.ranks",
         )
         .await?;
     // The eligible, and the wallets only a random draw of everyone picked.
@@ -501,6 +505,7 @@ async fn pick(c: &Client, prior: &HashMap<String, Record>, everyone: &[String], 
         c.execute(&stmt, &[&(day as f64), w, &as_json(prior.get(w)), &as_json(paper.get(w)), &rk]).await?;
     }
     s.day = day;
+    s.rules = RULES.to_string();
     log!("alloc: {} eligible ({} with paper lots), {} picks for {} books", pooled.len(),
         pooled.iter().filter(|x| x.2.is_some()).count(), s.picks.len(), books.len());
     Ok(())
@@ -578,7 +583,7 @@ mod tests {
 
     #[test]
     fn scores_and_bets() {
-        let r = Record { n: 100.0, cost: 100.0, pnl: 10.0, win: 60.0, loss: 50.0, r2: 100.0, dd: 20.0 };
+        let r = Record { n: 100.0, cost: 100.0, pnl: 10.0, win: 60.0, loss: 50.0, r2: 100.0, dd: 20.0, days: 40.0 };
         assert!((r.score(Score::Shrunk) - 10.0 / 150.0).abs() < 1e-12);
         assert!((r.score(Score::ExpDd) - 0.1 / 20.0).abs() < 1e-12);
         assert!((r.score(Score::Calmar) - 0.5).abs() < 1e-12);
