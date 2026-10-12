@@ -218,6 +218,28 @@ impl Api {
         Ok(m)
     }
 
+    /// The price of each token now (gamma's outcome price; a settled one's final price), 40
+    /// tokens a request.
+    pub async fn prices(&self, tokens: &[String]) -> Result<HashMap<String, f64>> {
+        let mut out = HashMap::new();
+        for chunk in tokens.chunks(40) {
+            for closed in ["", "&closed=true"] {
+                let left: Vec<&String> = chunk.iter().filter(|t| !out.contains_key(*t)).collect();
+                if left.is_empty() {
+                    break;
+                }
+                let q: Vec<String> = left.iter().map(|t| format!("clob_token_ids={t}")).collect();
+                let v = self.get(&format!("{GAMMA}/markets?{}{closed}&limit={}", q.join("&"), left.len() * 2)).await?;
+                for m in v.as_array().map(|a| a.iter().filter_map(Self::parse_market).collect::<Vec<_>>()).unwrap_or_default() {
+                    for (t, p) in m.tokens.iter().zip(&m.prices) {
+                        out.insert(t.clone(), *p);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// The closed markets among those of `tokens` (at most ~40: they all go in the URL).
     pub async fn closed_markets(&self, tokens: &[String]) -> Result<Vec<Market>> {
         let q: Vec<String> = tokens.iter().map(|t| format!("clob_token_ids={t}")).collect();

@@ -8,7 +8,11 @@
 //!          executor's single retry). A miss is also priced uncapped ("shadow"), to see what
 //!          the cap saved or cost.
 //!   once   one buy per wallet and market in `market_gap_s` (pieces of one order within
-//!          `join_s` are one trade; wallets looping both sides of a market take one copy).
+//!          `join_s` are one trade; wallets looping both sides of a market take one copy),
+//!          except that a window a small order (under `BIG_ORDER` dollars) opened does not hold
+//!          back a big one: a buy there waits `ORDER_S` for its pieces and is copied if they
+//!          add up to `BIG_ORDER`. Each buy event keeps the order's dollars seen by then
+//!          (`wallet_usd`): the allocator's books copy only the big ones.
 //!   late   a buy first seen over REST more than `rest_max_age_s` after the trade is a miss.
 //!   sell   when the wallet sells an outcome we hold for it: the share it sold (from its
 //!          position after the sale), then once the positions API has caught up
@@ -43,6 +47,13 @@ use crate::live::Live;
 use crate::log;
 use crate::stream::{Seen, Source};
 
+/// A trader's order of this many dollars is a real bet (the allocator's books copy only these;
+/// its prior, the backtest, counted only these).
+pub const BIG_ORDER: f64 = 100.0;
+/// The pieces of an order that count to its size: within this many seconds of the first (what
+/// the copier has seen by the time its own order lands).
+pub const ORDER_S: f64 = 2.0;
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Lot {
     pub wallet: String,
@@ -58,6 +69,9 @@ pub struct State {
     pub lots: HashMap<String, Lot>,
     /// "wallet|condition" -> when a buy was last copied there.
     pub market_copied: HashMap<String, f64>,
+    /// The "wallet|condition" windows a small order opened: a big one is still copied there.
+    #[serde(default)]
+    pub small_windows: HashSet<String>,
     /// "wallet|token" -> the most the wallet was seen holding.
     pub their_peak: HashMap<String, f64>,
     /// "wallet|token" -> the most we held for it.
@@ -76,6 +90,8 @@ pub struct Engine {
     state_path: PathBuf,
     seen: Mutex<(HashSet<String>, VecDeque<String>)>,
     pending: Mutex<HashMap<(String, String, bool), f64>>,
+    /// (wallet, token) -> the buy order being copied: its first trade's time and dollars so far.
+    orders: Mutex<HashMap<(String, String), (f64, f64)>>,
     rechecks: Mutex<HashSet<String>>,
     limit: Semaphore,
     db: Option<mpsc::UnboundedSender<db::Write>>,
@@ -123,6 +139,7 @@ impl Engine {
             state_path,
             seen: Mutex::new((HashSet::new(), VecDeque::new())),
             pending: Mutex::new(HashMap::new()),
+            orders: Mutex::new(HashMap::new()),
             rechecks: Mutex::new(HashSet::new()),
             // Bots trading the 5-minute crypto markets come in bursts: room for them, so a copy
             // is not late for waiting its turn.
@@ -151,11 +168,13 @@ impl Engine {
     pub async fn save(&self, to_db: bool) {
         let t = now();
         self.pending.lock().await.retain(|_, ts| t - *ts < 3600.0);
+        self.orders.lock().await.retain(|_, o| t - o.0 < 3600.0);
         let json = {
             let mut st = self.state.lock().await;
             st.lots.retain(|_, l| l.shares > 1e-6);
-            let State { lots, market_copied, their_peak, our_peak } = &mut *st;
+            let State { lots, market_copied, small_windows, their_peak, our_peak } = &mut *st;
             market_copied.retain(|_, at| t - *at <= self.cfg.market_gap_s + 3600.0);
+            small_windows.retain(|k| market_copied.contains_key(k));
             their_peak.retain(|k, _| lots.contains_key(k));
             our_peak.retain(|k, _| lots.contains_key(k));
             serde_json::to_string(&*st)
@@ -211,10 +230,17 @@ impl Engine {
             }
         }
         let pkey = (t.wallet.clone(), t.token.clone(), buy);
-        // Pieces of one order already being copied.
+        // Pieces of one order already being copied (a buy's add to its size).
         if let Some(first) = self.pending.lock().await.get(&pkey) {
             let d = t.ts - first;
             if (0.0..=self.cfg.join_s).contains(&d) {
+                if buy {
+                    if let Some(o) = self.orders.lock().await.get_mut(&(t.wallet.clone(), t.token.clone())) {
+                        if t.ts - o.0 <= ORDER_S {
+                            o.1 += t.size * t.price;
+                        }
+                    }
+                }
                 return;
             }
         }
@@ -225,16 +251,42 @@ impl Engine {
                 }
             }
             let mkey = key(&t.wallet, if t.condition.is_empty() { &t.token } else { &t.condition });
-            {
+            let wait = {
                 let mut st = self.state.lock().await;
-                if let Some(at) = st.market_copied.get(&mkey) {
-                    if t.ts - at <= self.cfg.market_gap_s && t.ts >= *at - 60.0 {
-                        return;
+                match st.market_copied.get(&mkey) {
+                    Some(at) if t.ts - at <= self.cfg.market_gap_s && t.ts >= *at - 60.0 => {
+                        if !st.small_windows.contains(&mkey) {
+                            return;
+                        }
+                        // A small order opened this window: copied only if this one is big.
+                        true
+                    }
+                    _ => {
+                        st.market_copied.insert(mkey.clone(), t.ts);
+                        false
                     }
                 }
-                st.market_copied.insert(mkey, t.ts);
-            }
+            };
             self.pending.lock().await.insert(pkey, t.ts);
+            self.orders.lock().await.insert((t.wallet.clone(), t.token.clone()), (t.ts, t.size * t.price));
+            if wait {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs_f64(ORDER_S + 0.5)).await;
+                    let t = &seen.trade;
+                    let usd = self.order_usd(&t.wallet, &t.token).await;
+                    {
+                        let mut st = self.state.lock().await;
+                        if usd < BIG_ORDER || !st.small_windows.remove(&mkey) {
+                            return;
+                        }
+                        st.market_copied.insert(mkey, t.ts);
+                    }
+                    let me = self.clone();
+                    let _p = self.limit.acquire().await;
+                    me.copy_buy(seen).await;
+                });
+                return;
+            }
             if seen.source == Source::Rest && seen.recv - t.ts > self.cfg.rest_max_age_s {
                 // Our stream missed it: the live executor would have been too late as well.
                 self.write(json!({"kind": "buy", "wallet": t.wallet, "token": t.token, "condition": t.condition,
@@ -255,6 +307,11 @@ impl Engine {
             self.pending.lock().await.insert(pkey, t.ts);
             tokio::spawn(async move { self.follow_sale(seen.trade).await });
         }
+    }
+
+    /// The dollars of the wallet's buy order of the token seen so far.
+    async fn order_usd(&self, wallet: &str, token: &str) -> f64 {
+        self.orders.lock().await.get(&(wallet.to_string(), token.to_string())).map(|o| o.1).unwrap_or(0.0)
     }
 
     fn phase(m: Option<&Market>, ts: f64) -> &'static str {
@@ -347,14 +404,25 @@ impl Engine {
             *peak = peak.max(held);
         }
         let vs = f.avg().map(|p| round((p / t.price - 1.0) * 1e4, 1));
+        // The order's size by now; a small one leaves its market's window open to a big one.
+        let wallet_usd = self.order_usd(&t.wallet, &t.token).await;
+        {
+            let mkey = key(&t.wallet, if t.condition.is_empty() { &t.token } else { &t.condition });
+            let mut st = self.state.lock().await;
+            if wallet_usd < BIG_ORDER {
+                st.small_windows.insert(mkey);
+            } else {
+                st.small_windows.remove(&mkey);
+            }
+        }
         log!("{} BUY {:.3} -> {} {}", &t.wallet[..10], t.price,
             if filled { format!("filled ${:.2} @ {:.3} ({:+.0} bps)", f.usd, f.avg().unwrap_or(0.0), vs.unwrap_or(0.0)) }
             else if missed == "cap" { format!("missed (cap {cap})") } else { format!("missed ({missed}) {order}") },
             t.title.chars().take(50).collect::<String>());
         self.write(json!({
             "kind": "buy", "wallet": t.wallet, "token": t.token, "condition": t.condition, "title": t.title,
-            "wallet_price": t.price, "wallet_size": t.size, "trade_ts": t.ts, "recv": seen.recv,
-            "source": if seen.source == Source::Rest { "rest" } else { "stream" },
+            "wallet_price": t.price, "wallet_size": t.size, "wallet_usd": round(wallet_usd, 2), "trade_ts": t.ts,
+            "recv": seen.recv, "source": if seen.source == Source::Rest { "rest" } else { "stream" },
             "detect_s": round(seen.recv - t.ts, 3), "book_s": round(book_at - t.ts, 3),
             "phase": Self::phase(market.as_ref(), t.ts), "game_start": market.as_ref().and_then(|m| m.game_start),
             "tick": book.tick, "cap": cap, "best_ask": book.asks.first().map(|a| a.0),

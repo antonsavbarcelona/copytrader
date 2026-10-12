@@ -1,8 +1,9 @@
 //! The allocator: which of the wallets copied on paper a portfolio would copy.
 //!
 //! The paper copies every wallet followed at $1 (engine.rs). On top of it, virtual portfolios
-//! ("books") each take only some of those copies: the wallets their score ranks best, the
-//! bets their filter lets through, inside their caps. A book's copy fills as the paper's did
+//! ("books") each take only some of those copies: of the wallets their score ranks best, the
+//! real bets (orders of $100+, `BIG_ORDER`, as the prior counts them) that their price filter
+//! lets through, inside their caps. A book's copy fills as the paper's did
 //! (at $1 the size does not move the price), so its result is the paper lots it took. Nothing
 //! here trades: the books run side by side so the paper shows which score picks best.
 //!
@@ -11,11 +12,10 @@
 //! each pick has its own gate, then ranks who passes it by its score and takes the top N.
 //!
 //! A gate is a minimum record (copies or days with a $100+ bet), and one rule chose each
-//! score's (gate_pick.py, on the walk-forward of nine gates, alloc_gates.py): the gate whose
-//! worst result (lags 7 and 21 days, first and second half, top 10 and 30) is best; within 1
-//! point of it, the widest. A score that a short lucky record tops (a ratio: EXPDD, CALMAR,
-//! TSTAT, SHRUNK) gets a long one, 30+ days of the backtest's 90; PF 45+ copies; PNLSQRTN,
-//! which grows with the copies, 15+ days; PNL none (a big profit is a long record already).
+//! score's (research/gate_pick.py, on the walk-forward of nine gates): the gate whose worst
+//! result (lags 7 and 21 days, first and second half, top 10 and 30) is best; within 1 point
+//! of it, the widest. EXPDD, TSTAT, PNL and PNLSQRTN rank wallets with $100+ bets on 30+ days
+//! of the backtest's 90, PF those with 45+ copies, CALMAR and SHRUNK every wallet.
 //! EXPDD_ANY_30 is EXPDD with no gate: the gate's control.
 //!
 //! Each pick but RANDOM_10/30/50 and EXPDD_ANY_30 also runs as a twin with the strict gate the
@@ -30,8 +30,8 @@
 //!     PF        (wins + 5) / (losses + 5)         profit factor
 //!     TSTAT     (pnl / n) / standard error
 //!     RANDOM       a new draw each day of every wallet followed: the selection's control
-//!     RANDOM_ELIG  a new draw each day of those traded long: the score's control
-//!     ELIGIBLE     every wallet traded long: the gate's control
+//!     RANDOM_ELIG  a new draw each day of those through the 30-day gate: the score's control
+//!     ELIGIBLE     every wallet through the 30-day gate: the gate's control
 //!
 //! A book is a score, how many wallets (10, 30, 50) and which of their bets: all, MID (bought
 //! at 0.20-0.50), NO95 (below 0.95) or DOG (below 0.50); the backtest's walk-forward found the
@@ -47,7 +47,9 @@
 //!
 //! A wallet that leaves the picks gets no new copies, but its lots go on to its sale or the
 //! settlement. The paper copies at $1; a book's dollars are its share of those lots times its
-//! stake. Each copy a book wanted gets a row in `alloc` (granted or which cap refused it);
+//! stake. Every 6 h each book's balance, its open lots at the market's price, goes to
+//! `alloc_snap`; `copytrader alloc` judges the books since their rules began (README).
+//! Each copy a book wanted gets a row in `alloc` (granted or which cap refused it);
 //! `alloc_rank` keeps each day's records and ranks. The state is saved every 5 minutes; after
 //! a restart the events since are read again and their decisions, already written, kept.
 
@@ -62,14 +64,16 @@ use tokio_postgres::Client;
 
 use crate::api::{Api, now};
 use crate::db;
+use crate::engine::BIG_ORDER;
 use crate::log;
 
 /// The rules the picks are made by: when they change, the day's picks are made again.
-const RULES: &str = "a gate for each pick, strict twins";
+const RULES: &str = "a gate for each pick, strict twins; orders of $100+; prior v2";
 const PAPER_DAYS: i32 = 30;
 const EVENT_CAP: f64 = 3.0;
 const DEPOSIT: f64 = 1000.0;
 const SAVE_EVERY_S: f64 = 300.0;
+const SNAP_EVERY_S: f64 = 6.0 * 3600.0;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Score {
@@ -151,41 +155,53 @@ impl Book {
     }
 }
 
+/// A pick as `books` lists it: name, score, gate, wallets, bets, its ceilings at 2 and 4 copies
+/// of a wallet, the strict twin's.
+type Spec = (&'static str, Score, Gate, usize, Bets, f64, f64, f64, f64);
+
 fn books() -> Vec<Book> {
     use Bets::*;
     use Score::*;
     let (any, long) = (Gate::ANY, Gate::LONG);
-    let (n45, d15) = (Gate { n: 45.0, ..any }, Gate { days: 15.0, ..any });
-    // pick, score, gate, wallets, bets, the ceilings with 2 and 4 copies of a wallet
-    // (alloc_risk.py: the peak of copies open, lags 7 and 21 days, + 30%)
-    let list: &[(&str, Score, Gate, usize, Bets, f64, f64)] = &[
-        ("EXPDD_10", ExpDd, long, 10, All, 50.0, 100.0), ("EXPDD_30", ExpDd, long, 30, All, 110.0, 190.0),
-        ("EXPDD_50", ExpDd, long, 50, All, 150.0, 260.0),
-        ("EXPDD_ANY_30", ExpDd, any, 30, All, 110.0, 190.0),
-        ("CALMAR_10", Calmar, long, 10, All, 40.0, 70.0), ("CALMAR_30", Calmar, long, 30, All, 90.0, 160.0),
-        ("PNL_10", Pnl, any, 10, All, 40.0, 80.0), ("PNL_30", Pnl, any, 30, All, 110.0, 200.0),
-        ("PNLSQRTN_10", PnlSqrtN, d15, 10, All, 40.0, 70.0), ("PNLSQRTN_30", PnlSqrtN, d15, 30, All, 110.0, 200.0),
-        ("PF_30", Pf, n45, 30, All, 120.0, 220.0), ("PF_50", Pf, n45, 50, All, 180.0, 310.0),
-        ("TSTAT_30", TStat, long, 30, All, 130.0, 250.0),
-        ("SHRUNK_30", Shrunk, long, 30, All, 110.0, 190.0),
-        ("PF_MID_30", Pf, n45, 30, Mid, 80.0, 120.0), ("CALMAR_MID_30", Calmar, long, 30, Mid, 60.0, 90.0),
-        ("PF_NO95_30", Pf, n45, 30, No95, 120.0, 220.0), ("CALMAR_NO95_10", Calmar, long, 10, No95, 40.0, 70.0),
-        ("CALMAR_NO95_30", Calmar, long, 30, No95, 90.0, 160.0),
-        ("PF_DOG_30", Pf, n45, 30, Dog, 90.0, 150.0),
-        ("RANDOM_10", Random, any, 10, All, 90.0, 140.0), ("RANDOM_30", Random, any, 30, All, 240.0, 350.0),
-        ("RANDOM_50", Random, any, 50, All, 360.0, 510.0),
-        ("RANDOM_ELIG_30", Random, long, 30, All, 240.0, 420.0),
-        ("ELIGIBLE", Eligible, long, usize::MAX, All, 720.0, 1240.0),
+    let n45 = Gate { n: 45.0, ..any };
+    // pick, score, gate, wallets, bets; the ceilings with 2 and 4 copies of a wallet open, then
+    // the strict twin's (research/alloc_ceil2.py: the most copies open at once in the backtest
+    // of lags 7 and 21 days, the worse, + 30%; 0: no twin)
+    let list: &[Spec] = &[
+        ("EXPDD_10", ExpDd, long, 10, All, 50.0, 90.0, 50.0, 70.0),
+        ("EXPDD_30", ExpDd, long, 30, All, 110.0, 180.0, 110.0, 180.0),
+        ("EXPDD_50", ExpDd, long, 50, All, 160.0, 260.0, 160.0, 270.0),
+        ("EXPDD_ANY_30", ExpDd, any, 30, All, 70.0, 110.0, 0.0, 0.0),
+        ("CALMAR_10", Calmar, any, 10, All, 40.0, 50.0, 30.0, 50.0),
+        ("CALMAR_30", Calmar, any, 30, All, 90.0, 140.0, 90.0, 150.0),
+        ("PNL_10", Pnl, long, 10, All, 40.0, 70.0, 40.0, 70.0),
+        ("PNL_30", Pnl, long, 30, All, 90.0, 160.0, 100.0, 170.0),
+        ("PNLSQRTN_10", PnlSqrtN, long, 10, All, 50.0, 80.0, 50.0, 80.0),
+        ("PNLSQRTN_30", PnlSqrtN, long, 30, All, 100.0, 160.0, 100.0, 160.0),
+        ("PF_30", Pf, n45, 30, All, 100.0, 170.0, 120.0, 210.0),
+        ("PF_50", Pf, n45, 50, All, 170.0, 290.0, 180.0, 320.0),
+        ("TSTAT_30", TStat, long, 30, All, 130.0, 230.0, 110.0, 190.0),
+        ("SHRUNK_30", Shrunk, any, 30, All, 90.0, 150.0, 100.0, 150.0),
+        ("PF_MID_30", Pf, n45, 30, Mid, 70.0, 100.0, 80.0, 130.0),
+        ("CALMAR_MID_30", Calmar, any, 30, Mid, 60.0, 90.0, 70.0, 100.0),
+        ("PF_NO95_30", Pf, n45, 30, No95, 100.0, 170.0, 120.0, 200.0),
+        ("CALMAR_NO95_10", Calmar, any, 10, No95, 40.0, 50.0, 30.0, 50.0),
+        ("CALMAR_NO95_30", Calmar, any, 30, No95, 90.0, 140.0, 90.0, 150.0),
+        ("PF_DOG_30", Pf, n45, 30, Dog, 80.0, 120.0, 90.0, 150.0),
+        ("RANDOM_10", Random, any, 10, All, 70.0, 110.0, 0.0, 0.0),
+        ("RANDOM_30", Random, any, 30, All, 190.0, 260.0, 0.0, 0.0),
+        ("RANDOM_50", Random, any, 50, All, 280.0, 380.0, 0.0, 0.0),
+        ("RANDOM_ELIG_30", Random, long, 30, All, 260.0, 370.0, 200.0, 330.0),
+        ("ELIGIBLE", Eligible, long, usize::MAX, All, 4190.0, 6130.0, 580.0, 960.0),
     ];
     let inf = f64::INFINITY;
     let mut out = Vec::new();
-    // The strict twins: the picks with the first gate (their ceilings are of that gate already).
-    let strict: Vec<(String, Score, Gate, usize, Bets, f64, f64)> = list
+    // The strict twins: the picks with the allocator's first gate.
+    let strict = list
         .iter()
-        .filter(|x| x.2 != any || x.1 == Pnl)
-        .map(|&(pick, score, _, n, bets, c2, c4)| (format!("{pick}_STRICT"), score, Gate::STRICT, n, bets, c2, c4))
-        .collect();
-    let all = list.iter().map(|&(p, s, g, n, b, c2, c4)| (p.to_string(), s, g, n, b, c2, c4)).chain(strict);
+        .filter(|x| x.7 > 0.0)
+        .map(|&(pick, score, _, n, bets, _, _, s2, s4)| (format!("{pick}_STRICT"), score, Gate::STRICT, n, bets, s2, s4));
+    let all = list.iter().map(|&(p, s, g, n, b, c2, c4, _, _)| (p.to_string(), s, g, n, b, c2, c4)).chain(strict);
     for (pick, score, gate, n, bets, c2, c4) in all {
         for (mode, total, wallet, event) in [("W4", c4, 4.0, EVENT_CAP), ("W2", c2, 2.0, EVENT_CAP), ("1USD", inf, inf, inf)] {
             out.push(Book { name: format!("{pick}/{mode}"), pick: pick.clone(), score, gate, n, bets, total, wallet, event });
@@ -276,6 +292,12 @@ struct State {
     day: i64,
     #[serde(default)]
     rules: String,
+    /// When the rules began (unix seconds): the books are judged on what they did since.
+    #[serde(default)]
+    since: f64,
+    /// When the books' balances were last kept (`alloc_snap`).
+    #[serde(default)]
+    snapped: f64,
     /// When the state was last saved (not saved itself).
     #[serde(skip)]
     saved: f64,
@@ -346,7 +368,16 @@ async fn step(c: &Client, api: &Api, prior: &HashMap<String, Record>, everyone: 
     -> Result<()> {
     let day = (now() / 86400.0) as i64;
     if s.day != day || s.rules != RULES {
+        if s.rules != RULES {
+            s.since = now();
+            s.snapped = 0.0;
+        }
         pick(c, prior, everyone, books, s, day).await?;
+        save(c, s).await?;
+    }
+    if now() - s.snapped >= SNAP_EVERY_S {
+        snapshot(c, api, books, s.since).await?;
+        s.snapped = now();
         save(c, s).await?;
     }
     let rows = c
@@ -370,10 +401,12 @@ async fn step(c: &Client, api: &Api, prior: &HashMap<String, Record>, everyone: 
             "buy" => {
                 let fill = &data["fill"];
                 let cost = fill["usd"].as_f64().unwrap_or(0.0) + fill["fee"].as_f64().unwrap_or(0.0);
-                if cost <= 0.0 || !wanted.contains(&wallet) {
+                let price = data["wallet_price"].as_f64().unwrap_or(0.0);
+                // The trader's order in dollars (before the engine kept it: its first piece).
+                let bet = data["wallet_usd"].as_f64().unwrap_or_else(|| data["wallet_size"].as_f64().unwrap_or(0.0) * price);
+                if cost <= 0.0 || bet < BIG_ORDER || !wanted.contains(&wallet) {
                     continue;
                 }
-                let price = data["wallet_price"].as_f64().unwrap_or(0.0);
                 let event = match api.market(&token, 7.0 * 86400.0).await {
                     Ok(m) => m.event.unwrap_or(m.condition),
                     Err(_) => data["condition"].as_str().unwrap_or(&token).to_string(),
@@ -460,7 +493,8 @@ fn decide(b: &Book, s: &mut State, wallet: &str, token: &str, event: &str, cost:
     Decision { granted: cost, reason: "GRANTED" }
 }
 
-/// The paper's lots closed in the last 30 days, per wallet, as a record.
+/// The paper's lots closed in the last 30 days of orders of $100+ (as the prior counts), per
+/// wallet, as a record.
 async fn paper_records(c: &Client) -> Result<HashMap<String, Record>> {
     let rows = c
         .query(
@@ -469,13 +503,15 @@ async fn paper_records(c: &Client) -> Result<HashMap<String, Record>> {
                  sum(CASE WHEN kind = 'buy' THEN coalesce((data->'fill'->>'usd')::float8, 0) + coalesce((data->'fill'->>'fee')::float8, 0) ELSE 0 END) AS cost,
                  sum(CASE WHEN kind = 'sell' THEN coalesce((data->'fill'->>'usd')::float8, 0) - coalesce((data->'fill'->>'fee')::float8, 0)
                           WHEN kind = 'settle' THEN (data->>'usd')::float8 ELSE 0 END) AS back,
-                 bool_or(kind = 'settle' OR (kind = 'sell' AND (data->>'held_after')::float8 < 1e-6)) AS closed
+                 bool_or(kind = 'settle' OR (kind = 'sell' AND (data->>'held_after')::float8 < 1e-6)) AS closed,
+                 bool_or(kind = 'buy' AND coalesce((data->>'wallet_usd')::float8,
+                         (data->>'wallet_size')::float8 * (data->>'wallet_price')::float8) >= $2) AS big
                FROM events WHERE at > now() - make_interval(days => $1) AND wallet IS NOT NULL
                GROUP BY 1, 2)
              SELECT wallet, count(*)::float8, sum(cost), sum(back - cost), sum(greatest(back - cost, 0)),
                     sum(greatest(cost - back, 0)), sum(((back - cost) / cost) ^ 2)
-             FROM k WHERE closed AND cost > 0 GROUP BY 1",
-            &[&PAPER_DAYS],
+             FROM k WHERE closed AND big AND cost > 0 GROUP BY 1",
+            &[&PAPER_DAYS, &BIG_ORDER],
         )
         .await?;
     Ok(rows
@@ -568,48 +604,342 @@ fn fnv(s: &str) -> u64 {
     s.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3))
 }
 
-/// Each book's result so far: its copies, what they cost, what the closed ones made, and why
-/// copies were refused.
-pub async fn report(url: &str) -> Result<()> {
-    let c = db::connect(url).await?;
+/// A book's share of one paper lot (wallet, outcome): the copies it took and their dollars
+/// (at $1 a copy), the lot's cost, what came back and the shares still open, and when it
+/// closed (unix seconds; None while open).
+struct Held {
+    book: String,
+    token: String,
+    n: i64,
+    granted: f64,
+    cost: f64,
+    back: f64,
+    shares: f64,
+    closed: Option<f64>,
+}
+
+/// The books' shares of the paper lots, of the copies granted since `since` (unix seconds).
+async fn held(c: &Client, since: f64) -> Result<Vec<Held>> {
     let rows = c
         .query(
-            "WITH g AS (SELECT book, wallet, token, sum(granted) AS granted, count(*) AS n FROM alloc
-                        WHERE granted > 0 GROUP BY 1, 2, 3),
+            "WITH g AS (SELECT book, wallet, token, sum(granted) AS g, count(*) AS n FROM alloc
+                        WHERE granted > 0 AND at >= to_timestamp($1) GROUP BY 1, 2, 3),
                   k AS (SELECT e.wallet, e.token,
                           sum(CASE WHEN kind = 'buy' THEN coalesce((data->'fill'->>'usd')::float8, 0) + coalesce((data->'fill'->>'fee')::float8, 0) ELSE 0 END) AS cost,
                           sum(CASE WHEN kind = 'sell' THEN coalesce((data->'fill'->>'usd')::float8, 0) - coalesce((data->'fill'->>'fee')::float8, 0)
                                    WHEN kind = 'settle' THEN (data->>'usd')::float8 ELSE 0 END) AS back,
-                          bool_or(kind = 'settle' OR (kind = 'sell' AND (data->>'held_after')::float8 < 1e-6)) AS closed
+                          sum(CASE WHEN kind = 'buy' THEN coalesce((data->'fill'->>'shares')::float8, 0)
+                                   WHEN kind = 'sell' THEN -coalesce((data->'fill'->>'shares')::float8, 0) ELSE 0 END) AS shares,
+                          coalesce(bool_or(kind = 'settle' OR (kind = 'sell' AND (data->>'held_after')::float8 < 1e-6)), false) AS closed,
+                          extract(epoch FROM max(e.at) FILTER (WHERE kind IN ('sell', 'settle')))::float8 AS exit
                         FROM events e JOIN (SELECT DISTINCT wallet, token FROM g) t USING (wallet, token)
                         GROUP BY 1, 2)
-             SELECT g.book, sum(g.n)::bigint, sum(g.granted), count(*) FILTER (WHERE k.closed)::bigint,
-                    sum(g.granted) FILTER (WHERE k.closed),
-                    sum(g.granted / nullif(k.cost, 0) * (k.back - k.cost)) FILTER (WHERE k.closed),
-                    count(DISTINCT g.wallet)::bigint
-             FROM g JOIN k USING (wallet, token) GROUP BY 1 ORDER BY 1",
-            &[],
+             SELECT g.book, g.token, g.n, g.g, k.cost, k.back, k.shares, k.closed, k.exit
+             FROM g JOIN k USING (wallet, token) WHERE k.cost > 0",
+            &[&since],
         )
         .await?;
-    let stakes: HashMap<String, f64> = books().iter().map(|b| (b.name.clone(), b.stake())).collect();
-    println!("Each book: $1000; W4/W2 a copy = 1000 / its ceiling, 1USD $1 a copy; the result of closed lots.");
-    println!("{:28} {:>6} {:>7} {:>7} {:>9} {:>8} {:>9} {:>8} {:>7} {:>9}", "book", "$/copy", "copies", "closed", "$ closed", "pnl $",
-        "balance", "ROI", "wallets", "pnl at $1");
-    for r in &rows {
-        let (b, n, nc, gc, p, w): (String, i64, i64, Option<f64>, Option<f64>, i64) =
-            (r.get(0), r.get(1), r.get(3), r.get(4), r.get(5), r.get(6));
-        let Some(&k) = stakes.get(&b) else { continue };
-        let one = p.unwrap_or(0.0);
-        let (gc, p) = (gc.unwrap_or(0.0) * k, one * k);
-        println!("{b:28} {k:6.2} {n:7} {nc:7} {gc:9.2} {p:+8.2} {:9.2} {:+7.2}% {w:7} {one:+9.2}", DEPOSIT + p,
-            if gc > 0.0 { p / gc * 100.0 } else { 0.0 });
+    Ok(rows
+        .iter()
+        .map(|r| {
+            let closed: bool = r.get(7);
+            Held {
+                book: r.get(0),
+                token: r.get(1),
+                n: r.get(2),
+                granted: r.get(3),
+                cost: r.get(4),
+                back: r.get(5),
+                shares: if closed { 0.0 } else { r.get::<_, f64>(6).max(0.0) },
+                closed: closed.then(|| r.get::<_, Option<f64>>(8).unwrap_or_else(now)),
+            }
+        })
+        .collect())
+}
+
+/// A book's sums at $1 a copy: its copies and their cost, the closed ones' result, the open
+/// ones' cost and value now; for the closed lots' returns (weighted by the dollars the book
+/// put in) the sums a standard error needs; and the closed result in each half of the period.
+#[derive(Default, Clone)]
+struct Sum {
+    copies: i64,
+    cost: f64,
+    closed_n: i64,
+    closed_cost: f64,
+    closed_pnl: f64,
+    open_cost: f64,
+    open_value: f64,
+    w: f64,
+    wr: f64,
+    w2r: f64,
+    w2r2: f64,
+    w2: f64,
+    halves: [(f64, f64); 2],
+}
+
+impl Sum {
+    fn pnl(&self) -> f64 {
+        self.closed_pnl + self.open_value - self.open_cost
     }
+
+    fn roi(&self) -> f64 {
+        if self.closed_cost > 0.0 { self.closed_pnl / self.closed_cost } else { 0.0 }
+    }
+
+    /// The closed lots' ROI, 95% lower and upper bounds.
+    fn bounds(&self) -> (f64, f64) {
+        if self.w <= 0.0 {
+            return (0.0, 0.0);
+        }
+        let m = self.wr / self.w;
+        let se = ((self.w2r2 - 2.0 * m * self.w2r + m * m * self.w2).max(0.0)).sqrt() / self.w;
+        (m - 1.96 * se, m + 1.96 * se)
+    }
+
+    fn half_roi(&self, i: usize) -> f64 {
+        let (c, p) = self.halves[i];
+        if c > 0.0 { p / c } else { 0.0 }
+    }
+}
+
+/// Each book's sums; open lots at `prices` (their cost when a price is missing); the halves
+/// split at `split` (unix seconds).
+fn sums(held: &[Held], prices: &HashMap<String, f64>, split: f64) -> HashMap<String, Sum> {
+    let mut out: HashMap<String, Sum> = HashMap::new();
+    for h in held {
+        let s = out.entry(h.book.clone()).or_default();
+        let share = h.granted / h.cost;
+        s.copies += h.n;
+        s.cost += h.granted;
+        match h.closed {
+            Some(at) => {
+                let pnl = share * h.back - h.granted;
+                let r = h.back / h.cost - 1.0;
+                let w = h.granted;
+                s.closed_n += h.n;
+                s.closed_cost += w;
+                s.closed_pnl += pnl;
+                s.w += w;
+                s.wr += w * r;
+                s.w2r += w * w * r;
+                s.w2r2 += w * w * r * r;
+                s.w2 += w * w;
+                let half = &mut s.halves[usize::from(at >= split)];
+                half.0 += w;
+                half.1 += pnl;
+            }
+            None => {
+                s.open_cost += h.granted;
+                s.open_value += prices.get(&h.token).map(|p| share * (h.back + h.shares * p)).unwrap_or(h.granted);
+            }
+        }
+    }
+    out
+}
+
+/// The tokens the books hold open.
+fn open_tokens(held: &[Held]) -> Vec<String> {
+    let set: HashSet<&String> = held.iter().filter(|h| h.closed.is_none()).map(|h| &h.token).collect();
+    set.into_iter().cloned().collect()
+}
+
+/// Every book's balance now, open lots at the market's price, into `alloc_snap` (the history
+/// the drawdowns are read from).
+async fn snapshot(c: &Client, api: &Api, books: &[Book], since: f64) -> Result<()> {
+    let h = held(c, since).await?;
+    let prices = api.prices(&open_tokens(&h)).await?;
+    let all = sums(&h, &prices, now());
+    let none = Sum::default();
+    let names: Vec<String> = books.iter().map(|b| b.name.clone()).collect();
+    let copies: Vec<i64> = books.iter().map(|b| all.get(&b.name).unwrap_or(&none).copies).collect();
+    // Each book's sums in its dollars.
+    let col = |f: &dyn Fn(&Sum) -> f64| books.iter().map(|b| f(all.get(&b.name).unwrap_or(&none)) * b.stake()).collect::<Vec<f64>>();
+    let stakes: Vec<f64> = books.iter().map(Book::stake).collect();
+    let (cost, closed_cost, closed_pnl) = (col(&|s| s.cost), col(&|s| s.closed_cost), col(&|s| s.closed_pnl));
+    let (open_cost, open_value) = (col(&|s| s.open_cost), col(&|s| s.open_value));
+    c.execute(
+        "INSERT INTO alloc_snap (at, book, stake, copies, cost, closed_cost, closed_pnl, open_cost, open_value)
+         SELECT now(), * FROM unnest($1::text[], $2::float8[], $3::int8[], $4::float8[], $5::float8[], $6::float8[],
+                                     $7::float8[], $8::float8[]) ON CONFLICT DO NOTHING",
+        &[&names, &stakes, &copies, &cost, &closed_cost, &closed_pnl, &open_cost, &open_value],
+    )
+    .await?;
+    log!("alloc: snapshot of {} books, {} open outcomes priced", books.len(), prices.len());
+    Ok(())
+}
+
+/// The rule a book must pass to be followed (fixed before the results: README).
+const RULE_DAYS: f64 = 14.0;
+const RULE_CLOSED: i64 = 300;
+const RULE_MAX_DD: f64 = 200.0;
+
+/// Each book since the rules it runs by began: its copies, the closed ones' ROI with its 95%
+/// bounds and in each half of the period, the result with the open lots at today's prices, the
+/// worst drawdown of the balance; then the comparisons the paper is for, and the rule.
+pub async fn report(url: &str) -> Result<()> {
+    let c = db::connect(url).await?;
+    let api = Api::new()?;
+    let st = load(&c).await?;
+    let since = st.since;
+    let t = now();
+    let days = (t - since) / 86400.0;
+    let h = held(&c, since).await?;
+    let prices = api.prices(&open_tokens(&h)).await.unwrap_or_default();
+    let all = sums(&h, &prices, (since + t) / 2.0);
+    let books = books();
+    let none = Sum::default();
+    let sum = |name: &str| all.get(name).unwrap_or(&none);
+    // The worst drawdown: the snapshots' balances, then today's.
+    let mut dd: HashMap<String, (f64, f64)> = HashMap::new(); // book -> (peak, worst)
+    let snaps = c
+        .query("SELECT book, closed_pnl + open_value - open_cost FROM alloc_snap WHERE at >= to_timestamp($1) ORDER BY at",
+            &[&since])
+        .await?;
+    let mut track = |b: &str, bal: f64| {
+        let e = dd.entry(b.to_string()).or_insert((DEPOSIT, 0.0));
+        e.0 = e.0.max(bal);
+        e.1 = e.1.max(e.0 - bal);
+    };
+    for r in &snaps {
+        track(&r.get::<_, String>(0), DEPOSIT + r.get::<_, f64>(1));
+    }
+    for b in &books {
+        track(&b.name, DEPOSIT + sum(&b.name).pnl() * b.stake());
+    }
+    let max_dd = |b: &str| dd.get(b).map(|x| x.1).unwrap_or(0.0);
+
+    println!("Since {} UTC ({days:.1} days), the rules \"{RULES}\": copies of trader orders of ${BIG_ORDER}+.",
+        fmt_time(since));
+    println!("$1000 a book; W4/W2 a copy = 1000 / its ceiling, 1USD $1 a copy. ROI: the closed lots, [95% bounds],");
+    println!("first half / second half by close; pnl and balance: open lots at today's price; dd: the worst drop.\n");
+    println!("{:28} {:>6} {:>6} {:>6} {:>8} {:>17} {:>16} {:>9} {:>8} {:>7}", "book", "$/copy", "copies", "closed", "ROI",
+        "95%", "halves", "pnl $", "balance", "dd $");
+    for b in &books {
+        let (s, k) = (sum(&b.name), b.stake());
+        let (lo, hi) = s.bounds();
+        println!("{:28} {k:6.2} {:6} {:6} {:+7.1}% [{:+6.1}%,{:+6.1}%] {:+6.1}%/{:+6.1}% {:+9.2} {:8.2} {:7.2}", b.name, s.copies,
+            s.closed_n, s.roi() * 100.0, lo * 100.0, hi * 100.0, s.half_roi(0) * 100.0, s.half_roi(1) * 100.0, s.pnl() * k,
+            DEPOSIT + s.pnl() * k, max_dd(&b.name));
+    }
+
+    // The comparisons, each mode apart: ROI of the closed lots pooled over the picks compared.
+    let mode = |b: &Book| b.name.rsplit('/').next().unwrap_or("").to_string();
+    let pooled = |names: &[String]| {
+        let (c, p) = names.iter().map(|n| sum(n)).fold((0.0, 0.0), |a, s| (a.0 + s.closed_cost, a.1 + s.closed_pnl));
+        if c > 0.0 { p / c * 100.0 } else { 0.0 }
+    };
+    let scored = |b: &Book| !matches!(b.score, Score::Random | Score::Eligible);
+    for m in ["W4", "W2", "1USD"] {
+        let of_mode: Vec<&Book> = books.iter().filter(|b| mode(b) == m).collect();
+        println!("\n{m}:");
+        // Soft gate against the strict twin.
+        let pairs: Vec<(String, String)> = of_mode
+            .iter()
+            .filter(|b| !b.pick.ends_with("_STRICT"))
+            .filter_map(|b| {
+                let twin = format!("{}_STRICT/{m}", b.pick);
+                books.iter().any(|x| x.name == twin).then(|| (b.name.clone(), twin))
+            })
+            .collect();
+        let won = pairs.iter().filter(|(a, b)| sum(a).roi() > sum(b).roi()).count();
+        let (soft, strict): (Vec<String>, Vec<String>) = pairs.iter().cloned().unzip();
+        println!("  soft gate vs strict: soft ahead in {won} of {} pairs; pooled ROI {:+.1}% vs {:+.1}%", pairs.len(),
+            pooled(&soft), pooled(&strict));
+        // A score against a random pick of as many wallets.
+        let mut beat = (0, 0);
+        for b in of_mode.iter().filter(|b| scored(b)) {
+            if let Some(r) = control(&books, b) {
+                beat.1 += 1;
+                beat.0 += usize::from(sum(&b.name).roi() > sum(&r).roi());
+            }
+        }
+        let names = |f: &dyn Fn(&Book) -> bool| of_mode.iter().filter(|b| f(b)).map(|b| b.name.clone()).collect::<Vec<_>>();
+        println!("  scores vs RANDOM of as many wallets: ahead in {} of {}; pooled ROI scored {:+.1}%, RANDOM_10/30/50 {:+.1}%",
+            beat.0, beat.1, pooled(&names(&|b| scored(b))), pooled(&names(&|b| b.score == Score::Random && b.gate == Gate::ANY)));
+        let ex = |p: &str| format!("{:+.1}%", sum(&format!("{p}/{m}")).roi() * 100.0);
+        println!("  the gate, EXPDD_30: none {}, 30+ days {}, strict {}", ex("EXPDD_ANY_30"), ex("EXPDD_30"), ex("EXPDD_30_STRICT"));
+        let worst: Vec<f64> = of_mode.iter().filter(|b| scored(b)).map(|b| max_dd(&b.name)).collect();
+        println!("  scored books: pooled ROI {:+.1}%, drawdown mean ${:.0}, worst ${:.0}", pooled(&names(&|b| scored(b))),
+            worst.iter().sum::<f64>() / worst.len().max(1) as f64, worst.iter().cloned().fold(0.0, f64::max));
+    }
+
+    // The rule.
+    println!("\nThe rule (README): {RULE_DAYS}+ days, {RULE_CLOSED}+ closed copies, the 95% lower bound of ROI above 0, ROI above \
+              its RANDOM of as many wallets, both halves in profit, drawdown under ${RULE_MAX_DD}.");
+    let mut rows: Vec<(f64, String, Vec<&str>)> = books
+        .iter()
+        .filter(|b| scored(b))
+        .map(|b| {
+            let s = sum(&b.name);
+            let ctl = control(&books, b).map(|r| sum(&r).roi());
+            let mut miss = Vec::new();
+            if days < RULE_DAYS {
+                miss.push("days");
+            }
+            if s.closed_n < RULE_CLOSED {
+                miss.push("closed");
+            }
+            if s.bounds().0 <= 0.0 {
+                miss.push("bound");
+            }
+            if ctl.is_some_and(|r| s.roi() <= r) {
+                miss.push("random");
+            }
+            if s.halves.iter().any(|h| h.1 <= 0.0) {
+                miss.push("halves");
+            }
+            if max_dd(&b.name) >= RULE_MAX_DD {
+                miss.push("dd");
+            }
+            (s.bounds().0, b.name.clone(), miss)
+        })
+        .collect();
+    rows.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let pass: Vec<&(f64, String, Vec<&str>)> = rows.iter().filter(|r| r.2.is_empty()).collect();
+    if pass.is_empty() {
+        println!("  none passes yet; the best by the lower bound, and what they miss:");
+        for (lo, name, miss) in rows.iter().take(10) {
+            println!("    {name:28} {:+6.1}%  {}", lo * 100.0, miss.join(", "));
+        }
+    } else {
+        for (lo, name, _) in pass {
+            println!("  PASSES {name:28} lower bound {:+.1}%", lo * 100.0);
+        }
+    }
+
     println!("\nrefused:");
-    for r in c.query("SELECT book, reason, count(*) FROM alloc WHERE granted = 0 GROUP BY 1, 2 ORDER BY 1, 3 DESC", &[]).await? {
+    for r in c
+        .query("SELECT book, reason, count(*) FROM alloc WHERE granted = 0 AND at >= to_timestamp($1) GROUP BY 1, 2 ORDER BY 1, 3 DESC",
+            &[&since])
+        .await?
+    {
         let (b, why, n): (String, String, i64) = (r.get(0), r.get(1), r.get(2));
         println!("  {b:28} {why:13} {n}");
     }
     Ok(())
+}
+
+/// The random book of as many wallets in the same mode: a score's control.
+fn control(books: &[Book], b: &Book) -> Option<String> {
+    let mode = b.name.rsplit('/').next()?;
+    let name = format!("RANDOM_{}/{mode}", b.n);
+    books.iter().any(|x| x.name == name).then_some(name)
+}
+
+fn fmt_time(t: f64) -> String {
+    let days = (t / 86400.0).floor() as i64;
+    // Civil date from days (Howard Hinnant's algorithm).
+    let z = days + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    let s = (t - days as f64 * 86400.0) as i64;
+    format!("{y}-{m:02}-{d:02} {:02}:{:02}", s / 3600, s / 60 % 60)
 }
 
 #[cfg(test)]
@@ -634,6 +964,21 @@ mod tests {
     }
 
     #[test]
+    fn book_sums() {
+        let h = |granted: f64, cost: f64, back: f64, shares: f64, closed: Option<f64>| Held {
+            book: "B".into(), token: "t".into(), n: 1, granted, cost, back, shares, closed };
+        // Half of a $2 lot that came back $3; a lot of 10 shares open at 0.2 with $1 back.
+        let held = [h(1.0, 2.0, 3.0, 0.0, Some(10.0)), h(1.0, 1.0, 1.0, 10.0, None), h(1.0, 1.0, 0.0, 0.0, Some(30.0))];
+        let s = &sums(&held, &HashMap::from([("t".to_string(), 0.2)]), 20.0)["B"];
+        assert_eq!((s.copies, s.closed_n), (3, 2));
+        assert!((s.closed_pnl - (0.5 - 1.0)).abs() < 1e-12);
+        assert!((s.open_value - 3.0).abs() < 1e-12 && (s.pnl() - (-0.5 + 2.0)).abs() < 1e-12);
+        assert!((s.half_roi(0) - 0.5).abs() < 1e-12 && (s.half_roi(1) + 1.0).abs() < 1e-12);
+        let (lo, hi) = s.bounds();
+        assert!(lo < s.roi() && s.roi() < hi);
+    }
+
+    #[test]
     fn scores_and_bets() {
         let r = Record { n: 100.0, cost: 100.0, pnl: 10.0, win: 60.0, loss: 50.0, r2: 100.0, dd: 20.0, days: 40.0 };
         assert!((r.score(Score::Shrunk) - 10.0 / 150.0).abs() < 1e-12);
@@ -653,6 +998,7 @@ mod tests {
         assert!(Gate::ANY.passes(&Record::default(), &Record::default()));
         assert!(Gate::STRICT.passes(&r, &r) && !Gate::STRICT.passes(&r, &Record { pnl: -1.0, ..r }));
         assert!(!Gate::STRICT.passes(&Record { pnl: 4.0, ..r }, &r));
+        assert_eq!(fmt_time(1791676800.0 + 3723.0), "2026-10-11 01:02");
         let free = books().into_iter().find(|b| b.name == "PF_30/1USD").unwrap();
         assert_eq!(free.stake(), 1.0);
         let mut s = State::default();

@@ -88,6 +88,18 @@ CREATE TABLE IF NOT EXISTS alloc_rank (
     ranks  jsonb NOT NULL,
     PRIMARY KEY (day, wallet)
 );
+CREATE TABLE IF NOT EXISTS alloc_snap (
+    at          timestamptz NOT NULL,
+    book        text NOT NULL,
+    stake       float8 NOT NULL,
+    copies      bigint NOT NULL,
+    cost        float8 NOT NULL,
+    closed_cost float8 NOT NULL,
+    closed_pnl  float8 NOT NULL,
+    open_cost   float8 NOT NULL,
+    open_value  float8 NOT NULL,
+    PRIMARY KEY (at, book)
+);
 CREATE OR REPLACE VIEW buys AS
 SELECT id, at, wallet, title, data->>'phase' AS phase, data->>'source' AS source,
        data->>'missed' AS missed, (data->>'wallet_price')::float8 AS wallet_price,

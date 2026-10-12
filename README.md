@@ -48,19 +48,52 @@ wallets/picks.txt --alloc-prior wallets/backtest_stats.csv`:
   still, and live buys nothing new: it only follows its held lots to their sale or the
   settlement and redeems them.
 - The allocator (`src/allocator.rs`) keeps 138 virtual books over those copies, each with its
-  own $1000: 25 picks (a score - EXPDD, CALMAR, PNL, PNLSQRTN, PF, TSTAT, SHRUNK - of 10, 30
-  or 50 wallets, some only on the bets bought at 0.20-0.50, below 0.95 or below 0.50; and the
-  controls RANDOM_10/30/50 drawn from every wallet, RANDOM_ELIG_30, ELIGIBLE and EXPDD_ANY_30) times three
-  modes of risk: `W4` (4 copies of a wallet open at most, a copy = $1000 / the book's ceiling
-  of copies open), `W2` (the same at 2) and `1USD` ($1 a copy, no caps). The wallets are
-  ranked daily on the backtest's sums pooled with the paper's closed lots of 30 days. No gate is
-  common: each score has its own, chosen by one rule on the walk-forward (the best worst case
-  over lags, halves and sizes): EXPDD, CALMAR, TSTAT, SHRUNK $100+ bets on 30+ of the 90 days
-  (6,536 wallets), PF 45+ copies (10,153), PNLSQRTN 15+ days (11,042), PNL none (14,254).
-  Each pick but RANDOM_10/30/50 and EXPDD_ANY_30 also has a `_STRICT` twin with the first,
-  strict gate (100+ backtest copies at ROI > 5%, pooled ROI above 0; 955 wallets before the
-  paper): 46 picks in all, to tell soft gates from strict on paper.
-  Decisions go to `alloc`, the rankings to `alloc_rank`.
+  own $1000 (details below). Decisions go to `alloc`, the rankings to `alloc_rank`, every
+  book's balance every 6 h to `alloc_snap`.
+
+### The allocator's books
+
+**What a book copies.** Only a trader's real bets: orders of $100+ (`BIG_ORDER`; an order is
+the trader's fills of one outcome within 2 s, what the copier has seen when its own order
+lands; the event keeps it as `wallet_usd`). The prior, the backtest's per wallet sums, counts
+the same copies by the same rule (`research/build2.py`), so a wallet is ranked on the bets the
+book copies. The paper still copies every buy at $1 (one per wallet and market in 6 h), but a
+window a small order opened does not hold back a big one: the engine waits 2 s for its pieces.
+
+**Who a book copies.** No filter is common. Each pick has its own gate (a minimum record),
+ranks the wallets through it by its score, daily, on the prior pooled with the paper's closed
+lots of 30 days, and takes its top N. One rule chose each score's gate (`research/`): of nine
+gates, the one with the best worst result over lags 7 and 21 days, both halves of the period
+and top 10 and 30; within a point of it, the widest. The gates, of 14,224 wallets:
+
+| score | gate | wallets |
+|---|---|---|
+| EXPDD, TSTAT, PNL, PNLSQRTN | $100+ bets on 30+ of the backtest's 90 days | 6,193 |
+| PF | 45+ copies | 9,089 |
+| CALMAR, SHRUNK | none | 14,224 |
+
+EXPDD, TSTAT and PF chose the same gate on both versions of the backtest; for the others it
+changed, i.e. their gate hardly matters. Each pick but the random ones and EXPDD_ANY_30 also
+runs as a `_STRICT` twin with the allocator's first gate (100+ copies at ROI > 5%, pooled ROI
+above 0; 472 wallets): soft against strict on paper.
+
+The picks: EXPDD 10/30/50, CALMAR 10/30, PNL 10/30, PNLSQRTN 10/30, PF 30/50, TSTAT 30, SHRUNK 30,
+on the bets bought at 0.20-0.50 PF_MID_30 and CALMAR_MID_30, below 0.95 PF_NO95_30 and
+CALMAR_NO95_10/30, below 0.50 PF_DOG_30; the controls RANDOM_10/30/50 (from every wallet),
+RANDOM_ELIG_30 and ELIGIBLE (the 30-day gate's) and EXPDD_ANY_30 (EXPDD with no gate). 25
+picks and 21 strict twins, each in three modes of risk: `W4` (4 copies of a wallet open at
+most, an event 3, a copy = $1000 / the book's ceiling of copies open), `W2` (the same at 2)
+and `1USD` ($1 a copy, no caps): 138 books.
+
+**How a book is judged** (fixed before the results). `copytrader alloc` reports each book
+since its rules began: the closed copies' ROI with its 95% bounds and in each half of the
+period, the result with the open lots at today's price, the worst drawdown of the balance
+(from the 6-hourly snapshots); then soft gates against strict, scores against RANDOM of as
+many wallets, the gate on EXPDD, and the modes. A book is worth following when, after **14+
+days**, it has **300+ closed copies**, the **95% lower bound of its ROI is above 0**, its ROI
+is **above its RANDOM's** of as many wallets, **both halves** are in profit and its **drawdown
+stayed under $200**; of those, the highest lower bound first. One week is not enough: at a few
+hundred copies a book's ROI is known to about +-5-10 points.
 
 ```
 DATABASE_URL=postgresql://... target/release/copytrader alloc    # each book in dollars
