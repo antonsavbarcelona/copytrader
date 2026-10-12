@@ -7,9 +7,16 @@
 //! here trades: the books run side by side so the paper shows which score picks best.
 //!
 //! Each day every wallet's record is the 90-day backtest (the prior, a file of per wallet
-//! sums) pooled with the paper's lots closed in the last 30 days. Eligible: a wallet that has
-//! traded long, not a new one: $100+ bets on 30+ days of the backtest's 90, any style, any
-//! result; the scores pick among them (higher is better):
+//! sums) pooled with the paper's lots closed in the last 30 days. Nothing is filtered for all:
+//! each pick has its own gate, then ranks who passes it by its score and takes the top N.
+//!
+//! A gate is a minimum record (copies or days with a $100+ bet), and one rule chose each
+//! score's (gate_pick.py, on the walk-forward of nine gates, alloc_gates.py): the gate whose
+//! worst result (lags 7 and 21 days, first and second half, top 10 and 30) is best; within 1
+//! point of it, the widest. A score that a short lucky record tops (a ratio: EXPDD, CALMAR,
+//! TSTAT, SHRUNK) gets a long one, 30+ days of the backtest's 90; PF 45+ copies; PNLSQRTN,
+//! which grows with the copies, 15+ days; PNL none (a big profit is a long record already).
+//! EXPDD_ANY_30 is EXPDD with no gate: the gate's control. The scores (higher is better):
 //!
 //!     SHRUNK    pnl / (cost + 50)                 ROI, a short record pulled to 0
 //!     EXPDD     (pnl / n) / max(drawdown, 5)      expectancy over drawdown
@@ -19,8 +26,8 @@
 //!     PF        (wins + 5) / (losses + 5)         profit factor
 //!     TSTAT     (pnl / n) / standard error
 //!     RANDOM       a new draw each day of every wallet followed: the selection's control
-//!     RANDOM_ELIG  a new draw each day of the eligible: the score's control
-//!     ELIGIBLE     every eligible wallet: the filter's control
+//!     RANDOM_ELIG  a new draw each day of those traded long: the score's control
+//!     ELIGIBLE     every wallet traded long: the gate's control
 //!
 //! A book is a score, how many wallets (10, 30, 50) and which of their bets: all, MID (bought
 //! at 0.20-0.50), NO95 (below 0.95) or DOG (below 0.50); the backtest's walk-forward found the
@@ -53,10 +60,8 @@ use crate::api::{Api, now};
 use crate::db;
 use crate::log;
 
-/// Days (of the backtest's 90) with a $100+ bet: a wallet that has traded long.
-const MIN_DAYS: f64 = 30.0;
 /// The rules the picks are made by: when they change, the day's picks are made again.
-const RULES: &str = "eligible: 30+ days";
+const RULES: &str = "a gate for each pick";
 const PAPER_DAYS: i32 = 30;
 const EVENT_CAP: f64 = 3.0;
 const DEPOSIT: f64 = 1000.0;
@@ -72,8 +77,26 @@ enum Score {
     Pf,
     TStat,
     Random,
-    RandomAll,
     Eligible,
+}
+
+/// A pick's gate: who it may rank, by copies, days with a $100+ bet (of the backtest's 90)
+/// and pooled ROI.
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Gate {
+    n: f64,
+    days: f64,
+    roi: f64,
+}
+
+impl Gate {
+    const ANY: Gate = Gate { n: 0.0, days: 0.0, roi: f64::NEG_INFINITY };
+    /// Traded long: $100+ bets on 30+ days of the 90.
+    const LONG: Gate = Gate { days: 30.0, ..Gate::ANY };
+
+    fn passes(&self, r: &Record) -> bool {
+        r.n >= self.n && r.days >= self.days && r.roi() > self.roi
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -101,6 +124,7 @@ struct Book {
     /// The pick (score, wallets, bets) the modes share.
     pick: String,
     score: Score,
+    gate: Gate,
     n: usize,
     bets: Bets,
     /// Copies open at most: the book's, one wallet's, one event's.
@@ -123,31 +147,34 @@ impl Book {
 fn books() -> Vec<Book> {
     use Bets::*;
     use Score::*;
-    // pick, score, wallets, bets, the ceilings with 2 and 4 copies of a wallet (alloc_risk.py:
-    // the peak of copies open, lags 7 and 21 days, + 30%)
-    let list: &[(&str, Score, usize, Bets, f64, f64)] = &[
-        ("EXPDD_10", ExpDd, 10, All, 50.0, 100.0), ("EXPDD_30", ExpDd, 30, All, 110.0, 190.0),
-        ("EXPDD_50", ExpDd, 50, All, 150.0, 260.0),
-        ("CALMAR_10", Calmar, 10, All, 40.0, 70.0), ("CALMAR_30", Calmar, 30, All, 90.0, 160.0),
-        ("PNL_10", Pnl, 10, All, 40.0, 80.0), ("PNL_30", Pnl, 30, All, 110.0, 200.0),
-        ("PNLSQRTN_10", PnlSqrtN, 10, All, 40.0, 70.0), ("PNLSQRTN_30", PnlSqrtN, 30, All, 110.0, 200.0),
-        ("PF_30", Pf, 30, All, 120.0, 220.0), ("PF_50", Pf, 50, All, 180.0, 310.0),
-        ("TSTAT_30", TStat, 30, All, 130.0, 250.0),
-        ("SHRUNK_30", Shrunk, 30, All, 110.0, 190.0),
-        ("PF_MID_30", Pf, 30, Mid, 80.0, 120.0), ("CALMAR_MID_30", Calmar, 30, Mid, 60.0, 90.0),
-        ("PF_NO95_30", Pf, 30, No95, 120.0, 220.0), ("CALMAR_NO95_10", Calmar, 10, No95, 40.0, 70.0),
-        ("CALMAR_NO95_30", Calmar, 30, No95, 90.0, 160.0),
-        ("PF_DOG_30", Pf, 30, Dog, 90.0, 150.0),
-        ("RANDOM_10", RandomAll, 10, All, 90.0, 140.0), ("RANDOM_30", RandomAll, 30, All, 240.0, 350.0),
-        ("RANDOM_50", RandomAll, 50, All, 360.0, 510.0),
-        ("RANDOM_ELIG_30", Random, 30, All, 240.0, 420.0),
-        ("ELIGIBLE", Eligible, usize::MAX, All, 720.0, 1240.0),
+    let (any, long) = (Gate::ANY, Gate::LONG);
+    let (n45, d15) = (Gate { n: 45.0, ..any }, Gate { days: 15.0, ..any });
+    // pick, score, gate, wallets, bets, the ceilings with 2 and 4 copies of a wallet
+    // (alloc_risk.py: the peak of copies open, lags 7 and 21 days, + 30%)
+    let list: &[(&str, Score, Gate, usize, Bets, f64, f64)] = &[
+        ("EXPDD_10", ExpDd, long, 10, All, 50.0, 100.0), ("EXPDD_30", ExpDd, long, 30, All, 110.0, 190.0),
+        ("EXPDD_50", ExpDd, long, 50, All, 150.0, 260.0),
+        ("EXPDD_ANY_30", ExpDd, any, 30, All, 110.0, 190.0),
+        ("CALMAR_10", Calmar, long, 10, All, 40.0, 70.0), ("CALMAR_30", Calmar, long, 30, All, 90.0, 160.0),
+        ("PNL_10", Pnl, any, 10, All, 40.0, 80.0), ("PNL_30", Pnl, any, 30, All, 110.0, 200.0),
+        ("PNLSQRTN_10", PnlSqrtN, d15, 10, All, 40.0, 70.0), ("PNLSQRTN_30", PnlSqrtN, d15, 30, All, 110.0, 200.0),
+        ("PF_30", Pf, n45, 30, All, 120.0, 220.0), ("PF_50", Pf, n45, 50, All, 180.0, 310.0),
+        ("TSTAT_30", TStat, long, 30, All, 130.0, 250.0),
+        ("SHRUNK_30", Shrunk, long, 30, All, 110.0, 190.0),
+        ("PF_MID_30", Pf, n45, 30, Mid, 80.0, 120.0), ("CALMAR_MID_30", Calmar, long, 30, Mid, 60.0, 90.0),
+        ("PF_NO95_30", Pf, n45, 30, No95, 120.0, 220.0), ("CALMAR_NO95_10", Calmar, long, 10, No95, 40.0, 70.0),
+        ("CALMAR_NO95_30", Calmar, long, 30, No95, 90.0, 160.0),
+        ("PF_DOG_30", Pf, n45, 30, Dog, 90.0, 150.0),
+        ("RANDOM_10", Random, any, 10, All, 90.0, 140.0), ("RANDOM_30", Random, any, 30, All, 240.0, 350.0),
+        ("RANDOM_50", Random, any, 50, All, 360.0, 510.0),
+        ("RANDOM_ELIG_30", Random, long, 30, All, 240.0, 420.0),
+        ("ELIGIBLE", Eligible, long, usize::MAX, All, 720.0, 1240.0),
     ];
     let inf = f64::INFINITY;
     let mut out = Vec::new();
-    for &(pick, score, n, bets, c2, c4) in list {
+    for &(pick, score, gate, n, bets, c2, c4) in list {
         for (mode, total, wallet, event) in [("W4", c4, 4.0, EVENT_CAP), ("W2", c2, 2.0, EVENT_CAP), ("1USD", inf, inf, inf)] {
-            out.push(Book { name: format!("{pick}/{mode}"), pick: pick.into(), score, n, bets, total, wallet, event });
+            out.push(Book { name: format!("{pick}/{mode}"), pick: pick.into(), score, gate, n, bets, total, wallet, event });
         }
     }
     out
@@ -169,6 +196,10 @@ pub struct Record {
 }
 
 impl Record {
+    fn roi(&self) -> f64 {
+        if self.cost > 0.0 { self.pnl / self.cost } else { 0.0 }
+    }
+
     fn score(&self, s: Score) -> f64 {
         let n = self.n.max(1.0);
         let mean = self.pnl / n;
@@ -181,7 +212,7 @@ impl Record {
             Score::PnlSqrtN => mean * n.sqrt(),
             Score::Pf => (self.win + 5.0) / (self.loss + 5.0),
             Score::TStat => mean / ((self.r2 / n - mean * mean).max(1e-6).sqrt() / n.sqrt()),
-            Score::Random | Score::RandomAll | Score::Eligible => 0.0,
+            Score::Random | Score::Eligible => 0.0,
         }
     }
 }
@@ -444,16 +475,17 @@ async fn paper_records(c: &Client) -> Result<HashMap<String, Record>> {
         .collect())
 }
 
-/// The day's picks of every book: the backtest pooled with the paper's closed lots.
+/// The day's picks of every book: the backtest pooled with the paper's closed lots, every
+/// wallet followed; each pick ranks those its gate lets through.
 async fn pick(c: &Client, prior: &HashMap<String, Record>, everyone: &[String], books: &[Book], s: &mut State, day: i64)
     -> Result<()> {
     let paper = paper_records(c).await?;
-    let mut pooled: Vec<(String, Record, Option<Record>)> = prior
-        .iter()
-        .filter(|(_, p)| p.days >= MIN_DAYS)
-        .map(|(w, p)| {
+    let all: HashSet<&String> = prior.keys().chain(everyone).collect();
+    let mut pooled: Vec<(String, Record, Option<Record>)> = all
+        .into_iter()
+        .map(|w| {
             let q = paper.get(w).copied();
-            let mut r = *p;
+            let mut r = prior.get(w).copied().unwrap_or_default();
             if let Some(q) = q {
                 r.n += q.n;
                 r.cost += q.cost;
@@ -468,18 +500,16 @@ async fn pick(c: &Client, prior: &HashMap<String, Record>, everyone: &[String], 
         .collect();
     pooled.sort_by(|a, b| a.0.cmp(&b.0));
     let mut ranks: HashMap<String, serde_json::Map<String, Value>> = HashMap::new();
+    let mut gated = Vec::new();
     s.picks.clear();
     for b in books {
         if s.picks.contains_key(&b.pick) {
             continue;
         }
-        let mut order: Vec<(&str, f64)> = if b.score == Score::RandomAll {
-            everyone.iter().map(|w| (w.as_str(), 0.0)).collect()
-        } else {
-            pooled.iter().map(|(w, r, _)| (w.as_str(), r.score(b.score))).collect()
-        };
+        let mut order: Vec<(&str, f64)> =
+            pooled.iter().filter(|(_, r, _)| b.gate.passes(r)).map(|(w, r, _)| (w.as_str(), r.score(b.score))).collect();
+        gated.push(format!("{} {}", b.pick, order.len()));
         match b.score {
-            Score::RandomAll => order.sort_by_key(|(w, _)| fnv(&format!("{day}{}{w}", b.pick))),
             Score::Random => order.sort_by_key(|(w, _)| fnv(&format!("{day}{}{w}", b.pick))),
             Score::Eligible => {}
             _ => order.sort_by(|a, b| b.1.total_cmp(&a.1)),
@@ -497,12 +527,9 @@ async fn pick(c: &Client, prior: &HashMap<String, Record>, everyone: &[String], 
         }
         s.picks.insert(b.pick.clone(), m);
     }
-    // The eligible, and the wallets only a random draw of everyone picked.
+    // The wallets some pick ranked (ELIGIBLE's are not ranked).
     let as_json = |r: Option<&Record>| r.map(|r| json!(r)).unwrap_or(Value::Null);
-    let mut rows: Vec<&String> = pooled.iter().map(|x| &x.0).collect();
-    let listed: HashSet<&String> = rows.iter().copied().collect();
-    let extra: Vec<&String> = ranks.keys().filter(|w| !listed.contains(w)).collect();
-    rows.extend(extra);
+    let rows: Vec<&String> = ranks.keys().collect();
     let wallets: Vec<String> = rows.iter().map(|w| w.to_string()).collect();
     let priors: Vec<Value> = rows.iter().map(|w| as_json(prior.get(*w))).collect();
     let papers: Vec<Value> = rows.iter().map(|w| as_json(paper.get(*w))).collect();
@@ -516,8 +543,8 @@ async fn pick(c: &Client, prior: &HashMap<String, Record>, everyone: &[String], 
     .await?;
     s.day = day;
     s.rules = RULES.to_string();
-    log!("alloc: {} eligible ({} with paper lots), {} picks for {} books", pooled.len(),
-        pooled.iter().filter(|x| x.2.is_some()).count(), s.picks.len(), books.len());
+    log!("alloc: {} wallets ({} with paper lots), {} picks for {} books; through each gate: {}", pooled.len(),
+        pooled.iter().filter(|x| x.2.is_some()).count(), s.picks.len(), books.len(), gated.join(", "));
     Ok(())
 }
 
@@ -556,7 +583,7 @@ pub async fn report(url: &str) -> Result<()> {
     for r in &rows {
         let (b, n, nc, gc, p, w): (String, i64, i64, Option<f64>, Option<f64>, i64) =
             (r.get(0), r.get(1), r.get(3), r.get(4), r.get(5), r.get(6));
-        let k = stakes.get(&b).copied().unwrap_or(1.0);
+        let Some(&k) = stakes.get(&b) else { continue };
         let one = p.unwrap_or(0.0);
         let (gc, p) = (gc.unwrap_or(0.0) * k, one * k);
         println!("{b:20} {k:6.2} {n:7} {nc:7} {gc:9.2} {p:+8.2} {:9.2} {:+7.2}% {w:7} {one:+9.2}", DEPOSIT + p,
@@ -576,8 +603,8 @@ mod tests {
 
     #[test]
     fn caps_and_duplicates() {
-        let b = Book { name: "T/W2".into(), pick: "T".into(), score: Score::Pnl, n: 2, bets: Bets::All, total: 4.0, wallet: 2.0,
-            event: 3.0 };
+        let b = Book { name: "T/W2".into(), pick: "T".into(), score: Score::Pnl, gate: Gate::ANY, n: 2, bets: Bets::All, total: 4.0,
+            wallet: 2.0, event: 3.0 };
         assert_eq!(b.stake(), 250.0);
         let mut s = State::default();
         let r = |s: &mut State, w: &str, t: &str, e: &str| decide(&b, s, w, t, e, 1.0).reason;
@@ -603,7 +630,9 @@ mod tests {
         assert!(Bets::Mid.takes(0.3) && !Bets::Mid.takes(0.1) && !Bets::Mid.takes(0.5));
         assert!(Bets::No95.takes(0.9) && !Bets::No95.takes(0.96));
         assert!(Bets::Dog.takes(0.49) && !Bets::Dog.takes(0.5));
-        assert_eq!(books().len(), 72);
+        assert_eq!(books().len(), 75);
+        assert!(Gate::LONG.passes(&r) && !Gate::LONG.passes(&Record { days: 29.0, ..r }));
+        assert!(Gate::ANY.passes(&Record::default()));
         let free = books().into_iter().find(|b| b.name == "PF_30/1USD").unwrap();
         assert_eq!(free.stake(), 1.0);
         let mut s = State::default();
