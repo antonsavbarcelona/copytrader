@@ -37,6 +37,9 @@ pub struct Config {
     /// The REST read-back reads only the wallets in this file (with thousands followed, a round
     /// of all would take hours; the stream sees every trade anyway).
     pub poll_file: Option<PathBuf>,
+    /// The allocator's prior, the backtest's CSV (wallet,n,roi,style); with it the allocator's
+    /// books run next to the paper (allocator.rs).
+    pub alloc_prior: Option<PathBuf>,
     /// Real orders (live.rs) instead of paper fills, events to their own tables.
     pub live: bool,
     /// Live: copy the golden list (trial.rs), at most `top_n` wallets, the best over the last 7 days
@@ -72,6 +75,7 @@ impl Default for Config {
             settle_every_s: 300,
             wallets_file: None,
             poll_file: None,
+            alloc_prior: None,
             live: false,
             top_n: 10,
             live_cap_abs: 0.03,
@@ -112,6 +116,7 @@ impl Config {
                 "--top" => c.top_n = v()?.parse()?,
                 "--wallets-file" => c.wallets_file = Some(PathBuf::from(v()?)),
                 "--poll-file" => c.poll_file = Some(PathBuf::from(v()?)),
+                "--alloc-prior" => c.alloc_prior = Some(PathBuf::from(v()?)),
                 "--settle-every-s" => c.settle_every_s = v()?.parse()?,
                 "--scout-min-week-trades" => c.scout_criteria.min_week_trades = v()?.parse()?,
                 "--scout-min-pnl" => c.scout_criteria.min_pnl = v()?.parse()?,

@@ -39,6 +39,8 @@ pub struct Market {
     pub fee_exp: f64,
     /// Neg-risk markets redeem through their own adapter.
     pub neg_risk: bool,
+    /// The event the market is part of (one game's winner, spread and total share it).
+    pub event: Option<String>,
 }
 
 impl Market {
@@ -188,6 +190,7 @@ impl Api {
             fee_rate: if fees { sched.get("rate").map(num).unwrap_or(0.07) } else { 0.0 },
             fee_exp: sched.get("exponent").map(num).filter(|e| *e > 0.0).unwrap_or(1.0),
             neg_risk: m["negRisk"].as_bool().unwrap_or(false),
+            event: m["events"][0]["slug"].as_str().map(str::to_string),
         })
     }
 
@@ -379,6 +382,7 @@ mod tests {
         let mut m = Market {
             condition: String::new(), question: String::new(), tokens: vec!["a".into(), "b".into()],
             prices: vec![1.0, 0.0], closed: true, game_start: None, fee_rate: 0.0, fee_exp: 1.0, neg_risk: false,
+            event: None,
         };
         assert!(m.settled());
         m.prices = vec![0.5, 0.5];
