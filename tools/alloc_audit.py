@@ -182,7 +182,7 @@ def main():
             sells[(e[3], e[4])].append((e[0], e[2], e[5] or {}))
     for b in books:
         _, _, stake_share, event_cap = parse(b)
-        ids = sorted(entries[b] + [i for (bb, i) in decisions if bb == b])
+        ids = sorted(set(entries[b]) | {i for (bb, i) in decisions if bb == b})  # a cut entry is both
         pos = {}  # entry id -> dict
         realized = 0.0
         # The book's timeline: its entries and refusals, and the paper's sales of what it holds.
