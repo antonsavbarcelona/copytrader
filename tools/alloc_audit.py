@@ -90,6 +90,23 @@ def picks_of(prior, day):
     return out
 
 
+def expand(st):
+    """The saved state with every position in full (the allocator saves each buy's names once,
+    in `lots`, and the positions as numbers)."""
+    if 'lots' not in st:
+        return st
+    lots = st['lots']
+    books = {}
+    for name, (realized, entries, cuts, refusals, closed, pos) in st['books'].items():
+        out = []
+        for i, price, capital, stake, shares0, shares, back in pos:
+            at, wallet, token, market, event = lots[str(i)]
+            out.append(dict(id=i, at=at, wallet=wallet, token=token, market=market, event=event, price=price, capital=capital,
+                            stake=stake, shares0=shares0, shares=shares, back=back))
+        books[name] = dict(realized=realized, entries=entries, cuts=cuts, refusals=refusals, closed=closed, positions=out)
+    return dict(st, books=books)
+
+
 def parse(book):
     s, n, r, e, c = book.rsplit('_', 4)
     return s, int(n), float(r[1:]) / 100, float(e[1:]) / 100
@@ -109,6 +126,7 @@ def main():
     cur = c.cursor()
     cur.execute("SELECT data FROM state WHERE id = 'alloc'")
     st = cur.fetchone()[0]
+    st = expand(st)
     if st.get('generation') != GEN:
         sys.exit(f"the saved state is of generation {st.get('generation')}, not {GEN}")
     last_id, since = st['last_id'], st['since']

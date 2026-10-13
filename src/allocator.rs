@@ -367,6 +367,60 @@ impl State {
     }
 }
 
+/// The state as it is saved: each paper buy's time, wallet, outcome, market and event once
+/// (`lots`, by the buy's event id), each book's positions only as numbers (the buy, price,
+/// capital, stake, shares bought and open, dollars back). A buy is in tens of books: its names
+/// once make the state several times smaller. The numbers are kept exactly.
+#[derive(Serialize, Deserialize)]
+struct Saved {
+    generation: i32,
+    last_id: i64,
+    since: f64,
+    status_at: f64,
+    lots: HashMap<i64, (f64, String, String, String, String)>,
+    /// book -> (realized, entries, cuts, refusals, closed, positions)
+    books: HashMap<String, (f64, u64, u64, u64, u64, Vec<(i64, f64, f64, f64, f64, f64, f64)>)>,
+}
+
+impl Saved {
+    fn of(s: &State) -> Saved {
+        let mut lots = HashMap::new();
+        let books = s
+            .books
+            .iter()
+            .map(|(name, b)| {
+                let pos = b
+                    .positions
+                    .iter()
+                    .map(|p| {
+                        lots.entry(p.id).or_insert_with(|| (p.at, p.wallet.clone(), p.token.clone(), p.market.clone(), p.event.clone()));
+                        (p.id, p.price, p.capital, p.stake, p.shares0, p.shares, p.back)
+                    })
+                    .collect();
+                (name.clone(), (b.realized, b.entries, b.cuts, b.refusals, b.closed, pos))
+            })
+            .collect();
+        Saved { generation: s.generation, last_id: s.last_id, since: s.since, status_at: s.status_at, lots, books }
+    }
+
+    fn state(self) -> Result<State> {
+        let mut books = HashMap::new();
+        for (name, (realized, entries, cuts, refusals, closed, pos)) in self.books {
+            let positions = pos
+                .into_iter()
+                .map(|(id, price, capital, stake, shares0, shares, back)| {
+                    let (at, wallet, token, market, event) =
+                        self.lots.get(&id).cloned().ok_or_else(|| anyhow::anyhow!("no lot {id}"))?;
+                    Ok(Position { id, at, wallet, token, market, event, price, capital, stake, shares0, shares, back })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            books.insert(name, BookState { realized, positions, entries, cuts, refusals, closed });
+        }
+        Ok(State { generation: self.generation, last_id: self.last_id, since: self.since, status_at: self.status_at, books,
+            ..Default::default() })
+    }
+}
+
 fn key(wallet: &str, token: &str) -> String {
     format!("{wallet}|{token}")
 }
@@ -460,8 +514,13 @@ pub async fn run(url: String, api: Api, prior: HashMap<String, Record>) {
 /// The saved state; another generation's (or none) starts the books again from the paper's
 /// next event.
 async fn load(c: &Client) -> Result<State> {
-    let saved = c.query_opt("SELECT data FROM state WHERE id = 'alloc'", &[]).await?;
-    let mut s: State = saved.and_then(|r| serde_json::from_value(r.get::<_, Value>(0)).ok()).unwrap_or_default();
+    let saved: Option<Value> = c.query_opt("SELECT data FROM state WHERE id = 'alloc'", &[]).await?.map(|r| r.get(0));
+    // The saved form, or the one before it (every position in full).
+    let mut s: State = match saved {
+        Some(v) if v.get("lots").is_some() => serde_json::from_value::<Saved>(v)?.state()?,
+        Some(v) => serde_json::from_value(v).unwrap_or_default(),
+        None => State::default(),
+    };
     if s.generation != GEN {
         let last: i64 = c.query_one("SELECT coalesce(max(id), 0) FROM events", &[]).await?.get(0);
         s = State { generation: GEN, last_id: last, since: now(), ..Default::default() };
@@ -476,7 +535,7 @@ async fn save(c: &Client, s: &mut State) -> Result<()> {
     c.execute(
         "INSERT INTO state (id, saved_at, data) VALUES ('alloc', now(), $1)
          ON CONFLICT (id) DO UPDATE SET saved_at = now(), data = EXCLUDED.data",
-        &[&serde_json::to_value(&*s)?],
+        &[&serde_json::to_value(Saved::of(s))?],
     )
     .await?;
     Ok(())
@@ -760,6 +819,38 @@ pub async fn report(url: &str, args: &[String]) -> Result<()> {
         if !matches!(b.score, Score::Random(_)) {
             println!("place among the 10 random draws: {:.1}", place(b));
         }
+        // The book's result by trader: its closed positions (to the event the state is of) and
+        // its open ones at today's price; together they are the book's result.
+        let mut by: HashMap<String, (i64, f64, usize, f64, f64)> = HashMap::new(); // closed, their pnl, open, stake, value
+        for r in c
+            .query("SELECT wallet, count(*), sum(pnl) FROM alloc_trades WHERE gen = $1 AND book = $2 AND close_id <= $3 GROUP BY 1",
+                &[&GEN, &name, &s.last_id])
+            .await?
+        {
+            let e = by.entry(r.get(0)).or_default();
+            e.0 = r.get(1);
+            e.1 = r.get(2);
+        }
+        for p in &bs.positions {
+            let e = by.entry(p.wallet.clone()).or_default();
+            e.2 += 1;
+            e.3 += p.stake;
+            e.4 += prices.get(&p.token).map(|q| p.back + p.shares * q).unwrap_or(p.back + p.risk());
+        }
+        let mut rows: Vec<(&String, &(i64, f64, usize, f64, f64))> = by.iter().collect();
+        rows.sort_by(|a, b| (b.1.1 + b.1.4 - b.1.3).total_cmp(&(a.1.1 + a.1.4 - a.1.3)));
+        println!("\nby trader: closed (their result), open (stake, now), total");
+        println!("  {:42} {:>6} {:>10} {:>5} {:>9} {:>9} {:>10}", "wallet", "closed", "result $", "open", "stake $", "now $", "total $");
+        let (mut closed_sum, mut total_sum) = (0.0, 0.0);
+        for (w, (n, pnl, open, stake, value)) in &rows {
+            closed_sum += pnl;
+            total_sum += pnl + value - stake;
+            println!("  {w:42} {n:6} {pnl:+10.2} {open:5} {stake:9.2} {value:9.2} {:+10.2}", pnl + value - stake);
+        }
+        println!("  {:42} {:>6} {closed_sum:+10.2} {:>5} {:>9} {:>9} {total_sum:+10.2}", "all", "", "", "", "");
+        println!("  check: the closed by trader {closed_sum:+.2} = the book's realized {:+.2}; the total {total_sum:+.2} = \
+                  its value now - ${DEPOSIT:.0} {:+.2}", bs.realized, equity(bs, &prices) - DEPOSIT);
+
         println!("\nopen:");
         for p in &bs.positions {
             println!("  {} {} {:.3} stake ${:.2} risk ${:.2} now {}", fmt_time(p.at), &p.wallet[..10], p.price, p.stake, p.risk(),
@@ -908,6 +999,26 @@ mod tests {
     fn pos(wallet: &str, market: &str, event: &str) -> Position {
         Position { id: 1, at: 0.0, wallet: wallet.into(), token: format!("{market}y"), market: market.into(), event: event.into(),
             price: 0.5, capital: 0.0, stake: 0.0, shares0: 0.0, shares: 0.0, back: 0.0 }
+    }
+
+    #[test]
+    fn saved_form() {
+        let mut s = State { generation: GEN, last_id: 9, since: 1.5, status_at: 2.5, ..Default::default() };
+        let p = Position { stake: 33.15, shares0: 0.1 + 0.2, shares: 1.0 / 3.0, back: 2.0f64.sqrt(), capital: 10_165.75, price: 0.123,
+            ..pos("w", "m", "e") };
+        s.books.insert("A".into(), BookState { realized: -1.0 / 7.0, positions: vec![p.clone()], entries: 3, cuts: 1, refusals: 2,
+            closed: 4 });
+        s.books.insert("B".into(), BookState { positions: vec![Position { stake: 5.0, ..p.clone() }], ..Default::default() });
+        let v = serde_json::to_value(Saved::of(&s)).unwrap();
+        assert_eq!(v["lots"].as_object().unwrap().len(), 1);
+        let back = serde_json::from_value::<Saved>(serde_json::from_str(&v.to_string()).unwrap()).unwrap().state().unwrap();
+        let (a, b) = (&back.books["A"], &s.books["A"]);
+        assert_eq!((a.realized, a.entries, a.cuts, a.refusals, a.closed), (b.realized, b.entries, b.cuts, b.refusals, b.closed));
+        let (x, y) = (&a.positions[0], &b.positions[0]);
+        assert_eq!((x.id, x.at, &x.wallet, &x.token, &x.market, &x.event), (y.id, y.at, &y.wallet, &y.token, &y.market, &y.event));
+        assert_eq!((x.price, x.capital, x.stake, x.shares0, x.shares, x.back), (y.price, y.capital, y.stake, y.shares0, y.shares, y.back));
+        assert_eq!(back.books["B"].positions[0].stake, 5.0);
+        assert_eq!((back.last_id, back.since, back.status_at), (9, 1.5, 2.5));
     }
 
     #[test]
