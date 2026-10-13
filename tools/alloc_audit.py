@@ -10,6 +10,7 @@ done and compares.
   caps      at each entry, with the positions open then (each at the share still open): 2 per
             wallet and outcome, everything 100%, the event the book's limit, the wallet 20%
   pnl       each position's dollars back from the paper's sales and settlement, to the cent
+  status    every hourly status's open positions and risk = the replay's at its event
   balance   the state's and every status row's capital = $10,000 + the closed positions' result
 
 DATABASE_URL=... py tools/alloc_audit.py [wallets/backtest_stats.csv]   (read only)"""
@@ -141,12 +142,16 @@ def main():
         for p in bs['positions']:
             opened[(b, p['id'])] = p
     books = sorted(set(st['books']) | {k[0] for k in trades} | {k[0] for k in decisions})
+    # The generation's events by id, as the allocator reads them (an event's time can be a little
+    # earlier than one written before it): from the paper event it began at (the state keeps it
+    # in states begun since this change; else just before the first event a book took or refused).
+    first = st.get('first_id') or min([k[1] for k in trades] + [k[1] for k in opened] + [k[1] for k in decisions] + [last_id + 1]) - 1
     print(f"generation {GEN}, up to paper event {last_id}: {len(trades)} closed, {len(opened)} open, {len(decisions)} cut or "
           f"refused, {len(books)} books with something")
 
     # The paper's buys since the generation began, and the sales and settlements of what the books held.
-    cur.execute("SELECT id, extract(epoch FROM at), kind, wallet, token, data FROM events WHERE at >= to_timestamp(%s) AND id <= %s "
-                "AND kind IN ('buy', 'sell', 'settle') ORDER BY id", (since, last_id))
+    cur.execute("SELECT id, extract(epoch FROM at), kind, wallet, token, data FROM events WHERE id > %s AND id <= %s "
+                "AND kind IN ('buy', 'sell', 'settle') ORDER BY id", (first, last_id))
     events = cur.fetchall()
     day_picks = {}
 
@@ -164,7 +169,7 @@ def main():
     ev_by_id = {e[0]: e for e in events}
 
     # picks and completeness
-    first = min((e[0] for e in events), default=0)
+    first_ev = min((e[0] for e in events), default=0)
     by_wallet_books = defaultdict(set)
     for e in events:
         if e[2] != 'buy':
@@ -185,7 +190,7 @@ def main():
         b, i = k
         e = ev_by_id.get(i)
         if e is None:
-            if i >= first:
+            if i >= first_ev:
                 bad('picks', f'{b}: event {i} not a paper buy of this generation')
             continue
         s, n, _, _ = parse(b)
@@ -198,16 +203,28 @@ def main():
     for e in events:
         if e[2] in ('sell', 'settle'):
             sells[(e[3], e[4])].append((e[0], e[2], e[5] or {}))
+    # Each book's hourly statuses: its open risk and positions, to set against the replay.
+    cur.execute("SELECT book, last_id, open_risk, positions FROM alloc_status WHERE gen = %s AND last_id <= %s", (GEN, last_id))
+    statuses = defaultdict(list)
+    for sb, lid, risk_at, n_at in cur.fetchall():
+        statuses[sb].append((lid + 0.5, 'status', (lid, risk_at, n_at)))
     for b in books:
         _, _, stake_share, event_cap = parse(b)
         ids = sorted(set(entries[b]) | {i for (bb, i) in decisions if bb == b})  # a cut entry is both
         pos = {}  # entry id -> dict
         realized = 0.0
         # The book's timeline: its entries and refusals, and the paper's sales of what it holds.
-        timeline = sorted([(i, 'entry') for i in ids] + [(x[0], 'paper', key) for key, v in sells.items() for x in v],
-                          key=lambda x: x[0])
+        timeline = sorted([(i, 'entry') for i in ids] + [(x[0], 'paper', key) for key, v in sells.items() for x in v]
+                          + statuses[b], key=lambda x: x[0])
         for item in timeline:
             i = item[0]
+            if item[1] == 'status':
+                lid, risk_at, n_at = item[2]
+                risk_now = sum(p['stake'] * p['shares'] / p['shares0'] for p in pos.values())
+                if n_at != len(pos) or abs(risk_at - risk_now) > EPS:
+                    bad('status', f'{b}: at event {lid} the status had {n_at} open, ${risk_at:.2f} at risk; recomputed '
+                                  f'{len(pos)}, ${risk_now:.2f}')
+                continue
             if item[1] == 'paper':
                 w, t = item[2]
                 held = [p for p in pos.values() if p['wallet'] == w and p['token'] == t]
@@ -303,7 +320,7 @@ def main():
             bad('balance', f'{b}: status at event {lid} capital ${cap:.2f}, recomputed ${want:.2f}')
 
     print(f'{len(rows)} status rows, {len(events)} paper events read')
-    for check in ['picks', 'complete', 'sizes', 'caps', 'pnl', 'balance']:
+    for check in ['picks', 'complete', 'sizes', 'caps', 'pnl', 'status', 'balance']:
         v = problems[check]
         print(f'{check:9} {"OK" if not v else f"{len(v)} problems"}')
         for m in v[:10]:

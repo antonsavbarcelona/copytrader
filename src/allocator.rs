@@ -335,9 +335,11 @@ struct State {
     /// The last paper event read.
     #[serde(default)]
     last_id: i64,
-    /// When the generation began (unix seconds).
+    /// When the generation began (unix seconds), and the paper event it began after.
     #[serde(default)]
     since: f64,
+    #[serde(default)]
+    first_id: i64,
     #[serde(default)]
     status_at: f64,
     #[serde(skip)]
@@ -383,6 +385,8 @@ struct Saved {
     generation: i32,
     last_id: i64,
     since: f64,
+    #[serde(default)]
+    first_id: i64,
     status_at: f64,
     lots: HashMap<i64, (f64, String, String, String, String)>,
     books: HashMap<String, SavedBook>,
@@ -406,7 +410,7 @@ impl Saved {
                 (name.clone(), (b.realized, b.entries, b.cuts, b.refusals, b.closed, pos))
             })
             .collect();
-        Saved { generation: s.generation, last_id: s.last_id, since: s.since, status_at: s.status_at, lots, books }
+        Saved { generation: s.generation, last_id: s.last_id, since: s.since, first_id: s.first_id, status_at: s.status_at, lots, books }
     }
 
     fn state(self) -> Result<State> {
@@ -422,7 +426,8 @@ impl Saved {
                 .collect::<Result<Vec<_>>>()?;
             books.insert(name, BookState { realized, positions, entries, cuts, refusals, closed });
         }
-        Ok(State { generation: self.generation, last_id: self.last_id, since: self.since, status_at: self.status_at, books,
+        Ok(State { generation: self.generation, last_id: self.last_id, since: self.since, first_id: self.first_id,
+            status_at: self.status_at, books,
             ..Default::default() })
     }
 }
@@ -529,7 +534,7 @@ async fn load(c: &Client) -> Result<State> {
     };
     if s.generation != GEN {
         let last: i64 = c.query_one("SELECT coalesce(max(id), 0) FROM events", &[]).await?.get(0);
-        s = State { generation: GEN, last_id: last, since: now(), ..Default::default() };
+        s = State { generation: GEN, last_id: last, first_id: last, since: now(), ..Default::default() };
         log!("alloc: generation {GEN} begins at paper event {last}");
     }
     s.index_open();
