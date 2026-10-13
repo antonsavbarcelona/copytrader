@@ -8,8 +8,8 @@ closedTime, market_meta.py); still open at the end it is valued at the last pric
 
 Each score's book gets its place among the 10 random draws of the same size, stake and limit
 (how many it is ahead of, 0-10) and the README's verdict is applied to the 90-day history.
-The drawdown is of the closed positions' capital day by day (with the open ones at their price
-it would be deeper).
+The drawdown: the worst drop of the capital from its peak at any position's close, as a share
+of the deposit (with the open ones at their price it would be deeper).
 
 FIXED=1: the stake and the caps of the $10,000 deposit, not the capital (no compounding: the
 backtest fills at the trader's price at any size). MINP=0.05: without the copies bought under
@@ -79,13 +79,14 @@ def book(copies, stake, cap):
     total = 0.0
     by_w, by_e, by_wm = defaultdict(float), defaultdict(float), defaultdict(int)
     entries = refused = cut = 0
-    day_cap = {}
+    peak, dd = DEPOSIT, 0.0  # the worst drop of the capital at any close, in dollars
     for i, (t0, tc, ret, w, m, e) in enumerate(copies):
         while heap and heap[0][0] <= t0:
             t, _, st, ow, om, oe, oret = heapq.heappop(heap)
             capital += st * oret
             total -= st; by_w[ow] -= st; by_e[oe] -= st; by_wm[(ow, om)] -= 1
-            day_cap[int(t // 86400)] = capital
+            peak = max(peak, capital)
+            dd = max(dd, peak - capital)
         if by_wm[(w, m)] >= ADDS:
             refused += 1
             continue
@@ -106,13 +107,9 @@ def book(copies, stake, cap):
         final += st * oret
         if t < END:
             capital += st * oret
-            day_cap[int(t // 86400)] = capital
-    eq, peak, dd = DEPOSIT, DEPOSIT, 0.0
-    for d in range(D0 + 30, D0 + 90):
-        eq = day_cap.get(d, eq)
-        peak = max(peak, eq)
-        dd = max(dd, 1 - eq / peak)
-    return final / DEPOSIT - 1, dd, entries, cut, refused
+            peak = max(peak, capital)
+            dd = max(dd, peak - capital)
+    return final / DEPOSIT - 1, dd / DEPOSIT, entries, cut, refused
 
 
 def run_pick(arg):

@@ -102,7 +102,13 @@ DATABASE_URL=postgresql://... target/release/copytrader alloc                # p
 DATABASE_URL=postgresql://... target/release/copytrader alloc --score LCB    # its 45 books
 DATABASE_URL=postgresql://... target/release/copytrader alloc --detail LCB_20_R0.5_E20
 DATABASE_URL=postgresql://... py tools/alloc_audit.py   # picks, entries, sizes, caps, pnl, balance by another way
+DATABASE_URL=postgresql://... py tools/alloc_vs_backtest.py   # the paper against the backtest's books
 ```
+
+The backtest of the same 990 books (`research/grid_backtest.csv`, days 30-90 of the 90) made
+every score look far better than the random draws; the paper is known to fall short of it for
+the picked wallets (`research/README.md`). The paper decides; `alloc_vs_backtest.py` shows how
+much of the backtest's result each score keeps.
 
 ## Round one: the big players
 
