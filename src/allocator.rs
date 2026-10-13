@@ -367,6 +367,13 @@ impl State {
     }
 }
 
+/// A saved position: the buy, price, capital, stake, shares bought and open, dollars back.
+type SavedPos = (i64, f64, f64, f64, f64, f64, f64);
+/// A saved book: realized, entries, cuts, refusals, closed, its positions.
+type SavedBook = (f64, u64, u64, u64, u64, Vec<SavedPos>);
+/// A book's result by trader: closed positions, their result, open ones, their stake and value.
+type ByTrader = (i64, f64, usize, f64, f64);
+
 /// The state as it is saved: each paper buy's time, wallet, outcome, market and event once
 /// (`lots`, by the buy's event id), each book's positions only as numbers (the buy, price,
 /// capital, stake, shares bought and open, dollars back). A buy is in tens of books: its names
@@ -378,8 +385,7 @@ struct Saved {
     since: f64,
     status_at: f64,
     lots: HashMap<i64, (f64, String, String, String, String)>,
-    /// book -> (realized, entries, cuts, refusals, closed, positions)
-    books: HashMap<String, (f64, u64, u64, u64, u64, Vec<(i64, f64, f64, f64, f64, f64, f64)>)>,
+    books: HashMap<String, SavedBook>,
 }
 
 impl Saved {
@@ -821,7 +827,7 @@ pub async fn report(url: &str, args: &[String]) -> Result<()> {
         }
         // The book's result by trader: its closed positions (to the event the state is of) and
         // its open ones at today's price; together they are the book's result.
-        let mut by: HashMap<String, (i64, f64, usize, f64, f64)> = HashMap::new(); // closed, their pnl, open, stake, value
+        let mut by: HashMap<String, ByTrader> = HashMap::new();
         for r in c
             .query("SELECT wallet, count(*), sum(pnl) FROM alloc_trades WHERE gen = $1 AND book = $2 AND close_id <= $3 GROUP BY 1",
                 &[&GEN, &name, &s.last_id])
@@ -837,7 +843,7 @@ pub async fn report(url: &str, args: &[String]) -> Result<()> {
             e.3 += p.stake;
             e.4 += prices.get(&p.token).map(|q| p.back + p.shares * q).unwrap_or(p.back + p.risk());
         }
-        let mut rows: Vec<(&String, &(i64, f64, usize, f64, f64))> = by.iter().collect();
+        let mut rows: Vec<(&String, &ByTrader)> = by.iter().collect();
         rows.sort_by(|a, b| (b.1.1 + b.1.4 - b.1.3).total_cmp(&(a.1.1 + a.1.4 - a.1.3)));
         println!("\nby trader: closed (their result), open (stake, now), total");
         println!("  {:42} {:>6} {:>10} {:>5} {:>9} {:>9} {:>10}", "wallet", "closed", "result $", "open", "stake $", "now $", "total $");
