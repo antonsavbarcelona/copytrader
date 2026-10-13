@@ -47,7 +47,7 @@ wallets/picks.txt --alloc-prior wallets/backtest_stats.csv`:
   (the backtest's 172 picks), the trade stream sees the rest. Round one and the trials stand
   still, and live buys nothing new: it only follows its held lots to their sale or the
   settlement and redeems them.
-- The allocator (`src/allocator.rs`) keeps 990 virtual books of $10,000 over those copies
+- The allocator (`src/allocator.rs`) keeps 1980 virtual books of $10,000 over those copies
   (details below): every closed position in `alloc_trades`, the cut and refused entries in
   `alloc_decisions`, every book's status each hour in `alloc_status`.
 
@@ -76,8 +76,13 @@ without: 20+ distinct markets for the scores that divide by risk, by the copies 
 | RANDOM1..10 | ten draws of those in profit, new each day: the control |
 
 **The grid**: 22 picks x 10/20/30/50/100 wallets x a stake of 0.5/1/2% of the capital x an
-event limit of 20/50/100% = 990 books (`LCB_20_R0.5_E20`). One pick takes the same wallets at
-every stake and limit.
+event limit of 20/50/100% x a buy cap of 3% or 10% over the trader's price = 1980 books
+(`LCB_20_R0.5_E20_C10`). One pick takes the same wallets at every stake, limit and cap.
+
+**The buy cap.** The paper buys every other wallet at most 2% over the trader's price; the
+wallets in profit (those a book may pick) at 10%, and fills the same order book at 3%
+alongside (`narrow` in the buy event, with its own retry). A `_C10` book takes the paper's
+fill, a `_C3` book the 3% one: the two show what paying up to 10% brings.
 
 **An entry.** A buy the paper copied of a picked wallet, each book apart (capital = $10,000 +
 the closed positions' result; a position's risk = its stake times the share still open):
@@ -92,20 +97,20 @@ picks gets no new entries; its open positions run to the end.
 **The verdict** (fixed before the start, 2026-10-13). Each score's book gets a place among
 the 10 random draws of the same size, stake and limit: how many of them it is ahead of by
 return (open positions at the market's price), 0-10, a random pick 5 on average. After **21
-days** a score works if its **mean place over its 45 books is 7.5+** and **over 5 on 4 of the
-5 sizes**. One lucky cell is not believed: of 540 scored books some beat the draws by chance.
+days** a score works if its **mean place over its 90 books is 7.5+** and **over 5 on 4 of the
+5 sizes**. One lucky cell is not believed: of 1,080 scored books some beat the draws by chance.
 The stakes and limits are compared apart, by return and drawdown, for the scores and the
 draws.
 
 ```
 DATABASE_URL=postgresql://... target/release/copytrader alloc                # places and verdicts
-DATABASE_URL=postgresql://... target/release/copytrader alloc --score LCB    # its 45 books
-DATABASE_URL=postgresql://... target/release/copytrader alloc --detail LCB_20_R0.5_E20
+DATABASE_URL=postgresql://... target/release/copytrader alloc --score LCB    # its 90 books
+DATABASE_URL=postgresql://... target/release/copytrader alloc --detail LCB_20_R0.5_E20_C10
 DATABASE_URL=postgresql://... py tools/alloc_audit.py   # picks, entries, sizes, caps, pnl, balance by another way
 DATABASE_URL=postgresql://... py tools/alloc_vs_backtest.py   # the paper against the backtest's books
 ```
 
-The backtest of the same 990 books (`research/grid_backtest.csv`, days 30-90 of the 90) made
+The backtest of the same 990 books (no buy cap: both caps' books are set against it) (`research/grid_backtest.csv`, days 30-90 of the 90) made
 every score look far better than the random draws; the paper is known to fall short of it for
 the picked wallets (`research/README.md`). The paper decides; `alloc_vs_backtest.py` shows how
 much of the backtest's result each score keeps.

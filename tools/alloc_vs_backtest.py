@@ -15,11 +15,13 @@ import psycopg2
 GEN, DEPOSIT, BT_DAYS = 1, 10_000.0, 60.0
 HERE = os.path.dirname(os.path.abspath(__file__))
 
+# The backtest has no buy cap (it fills at the trader's price): both caps' books against it.
 bt = {}
 for i, l in enumerate(open(os.path.join(HERE, '..', 'research', 'grid_backtest.csv'))):
     if i:
         f = l.strip().split(',')
-        bt[f[0]] = (float(f[1]), float(f[2]))
+        for c in ('_C3', '_C10'):
+            bt[f[0] + c] = (float(f[1]), float(f[2]))
 
 c = psycopg2.connect(os.environ['DATABASE_URL'])
 cur = c.cursor()
@@ -63,6 +65,15 @@ for n in [10, 20, 30, 50, 100]:
     p = sum(paper.get(b, 0.0) for b in bs) / len(bs)
     q = sum(bt[b][0] for b in bs) / len(bs) * k
     print(f'  top {n:3}: paper {p:+9,.0f} $  backtest {q:+9,.0f} $  kept {p / q if q else 0:6.0%}')
+
+print('\nby buy cap, the scores\' books and the random draws\':')
+for c in ('_C3', '_C10'):
+    for rnd in (False, True):
+        bs = [b for b in bt if b.endswith(c) and b.startswith('RANDOM') == rnd]
+        p = sum(paper.get(b, 0.0) for b in bs) / len(bs)
+        q = sum(bt[b][0] for b in bs) / len(bs) * k
+        print(f'  {c[1:]:4} {"random" if rnd else "scores":7} paper {p:+9,.0f} $ (dd {sum(dd[b] for b in bs) / len(bs):6,.0f} $)  '
+              f'backtest {q:+9,.0f} $  kept {p / q if q else 0:6.0%}')
 
 print('\nthe 15 best books on paper:')
 for b in sorted(paper, key=lambda b: -paper[b])[:15]:

@@ -408,6 +408,11 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         (Some(url), Some(path)) => match allocator::read_prior(path) {
             Ok(prior) => {
                 log!("alloc: prior of {} wallets from {}", prior.len(), path.display());
+                // The wallets the books may pick are bought at the wide cap, the narrow alongside.
+                let wide = allocator::pickable(&prior);
+                log!("paper: {} wallets bought at a cap of {}% (and {}% alongside)", wide.len(), engine::WIDE_CAP * 100.0,
+                    engine::NARROW_CAP * 100.0);
+                *paper.wide.lock().await = wide;
                 tokio::spawn(allocator::run(url.clone(), api.clone(), prior));
             }
             Err(e) => log!("alloc: OFF, {} not read: {e}", path.display()),

@@ -23,8 +23,10 @@
 //!                        the size): the scores' control
 //!
 //! The grid: 22 picks x 10/20/30/50/100 wallets x a stake of 0.5/1/2% of the book's capital x
-//! an event limit of 20/50/100% = 990 books, named like `LCB_20_R0.5_E20`. One pick takes the
-//! same wallets at every stake and limit: those books differ only in sizing.
+//! an event limit of 20/50/100% x a buy cap of 3% or 10% over the trader's price = 1980 books,
+//! named like `LCB_20_R0.5_E20_C10`. The paper buys the wallets in profit at the 10% cap and
+//! fills the same book at 3% alongside (engine.rs): a C10 book takes the first, a C3 book the
+//! second. One pick takes the same wallets at every stake, limit and cap.
 //!
 //! A buy of a picked wallet, each book apart (capital = $10,000 + the closed positions' result;
 //! a position's risk = its stake times the share of it still open):
@@ -62,6 +64,8 @@ const DEPOSIT: f64 = 10_000.0;
 const SIZES: [usize; 5] = [10, 20, 30, 50, 100];
 const STAKES: [f64; 3] = [0.005, 0.01, 0.02];
 const EVENT_CAPS: [f64; 3] = [0.2, 0.5, 1.0];
+/// The buy caps: 3% (the paper's fill at `NARROW_CAP`) and 10% (its own, `WIDE_CAP`).
+const PRICE_CAPS: [u8; 2] = [3, 10];
 const RANDOMS: u8 = 10;
 const TOTAL_CAP: f64 = 1.0;
 const TRADER_CAP: f64 = 0.2;
@@ -206,6 +210,11 @@ pub fn read_prior(path: &Path) -> Result<HashMap<String, Record>> {
     Ok(out)
 }
 
+/// The wallets a book may pick: the copy in profit.
+pub fn pickable(prior: &HashMap<String, Record>) -> HashSet<String> {
+    prior.iter().filter(|(_, r)| r.in_profit()).map(|(w, _)| w.clone()).collect()
+}
+
 /// The wallets of every pick (score, size), in order of rank, for the day.
 fn picks(prior: &HashMap<String, Record>, day: i64) -> HashMap<(Score, usize), Vec<String>> {
     let mut pool: Vec<(&String, &Record)> = prior.iter().filter(|(_, r)| r.in_profit()).collect();
@@ -246,13 +255,15 @@ fn fnv(s: &str) -> u64 {
 }
 
 struct Book {
-    /// `LCB_20_R0.5_E20`.
+    /// `LCB_20_R0.5_E20_C10`.
     name: String,
     score: Score,
     size: usize,
     /// The stake, a share of the capital, and the most of it one event may hold.
     stake: f64,
     event_cap: f64,
+    /// Bought at the 3% cap (the paper's `narrow` fill), else at 10%.
+    narrow: bool,
 }
 
 fn books() -> Vec<Book> {
@@ -262,8 +273,10 @@ fn books() -> Vec<Book> {
         for &size in &SIZES {
             for &stake in &STAKES {
                 for &event_cap in &EVENT_CAPS {
-                    let name = format!("{}_{size}_R{}_E{}", score.name(), pct(stake), pct(event_cap));
-                    out.push(Book { name, score, size, stake, event_cap });
+                    for c in PRICE_CAPS {
+                        let name = format!("{}_{size}_R{}_E{}_C{c}", score.name(), pct(stake), pct(event_cap));
+                        out.push(Book { name, score, size, stake, event_cap, narrow: c == 3 });
+                    }
                 }
             }
         }
@@ -507,13 +520,13 @@ async fn step(c: &Client, api: &Api, prior: &HashMap<String, Record>, books: &[B
         let wallet: String = r.get::<_, Option<String>>(2).unwrap_or_default();
         let token: String = r.get::<_, Option<String>>(3).unwrap_or_default();
         s.last_id = id;
-        let fill = &data["fill"];
-        let (usd, fee, shares) = (fill["usd"].as_f64().unwrap_or(0.0), fill["fee"].as_f64().unwrap_or(0.0),
-            fill["shares"].as_f64().unwrap_or(0.0));
+        let read = |f: &Value| (f["usd"].as_f64().unwrap_or(0.0), f["fee"].as_f64().unwrap_or(0.0), f["shares"].as_f64().unwrap_or(0.0));
+        let (usd, fee, shares) = read(&data["fill"]);
+        // The 3% books' fill: the paper's at the narrow cap (its own fill when there is none).
+        let (n_usd, n_fee, n_shares) = if data["narrow"].is_object() { read(&data["narrow"]["fill"]) } else { (usd, fee, shares) };
         match kind.as_str() {
             "buy" => {
-                let cost = usd + fee;
-                if cost <= 0.0 || shares <= 0.0 {
+                if (usd + fee <= 0.0 || shares <= 0.0) && (n_usd + n_fee <= 0.0 || n_shares <= 0.0) {
                     continue;
                 }
                 let Some(idx) = s.picked.get(&wallet).cloned() else {
@@ -526,11 +539,16 @@ async fn step(c: &Client, api: &Api, prior: &HashMap<String, Record>, books: &[B
                     Err(_) => market.clone(),
                 };
                 let base = Position { id, at, wallet: wallet.clone(), token: token.clone(), market: market.clone(),
-                    event: event.clone(), price: usd / shares, capital: 0.0, stake: 0.0, shares0: 0.0, shares: 0.0, back: 0.0 };
+                    event: event.clone(), price: 0.0, capital: 0.0, stake: 0.0, shares0: 0.0, shares: 0.0, back: 0.0 };
                 for i in idx {
                     let b = &books[i];
+                    let (paid, fees, sh) = if b.narrow { (n_usd, n_fee, n_shares) } else { (usd, fee, shares) };
+                    if paid + fees <= 0.0 || sh <= 0.0 {
+                        // Not filled at this book's cap: no copy to take.
+                        continue;
+                    }
                     let bs = s.books.entry(b.name.clone()).or_default();
-                    let (pos, why) = decide(b, bs, base.clone(), cost, shares);
+                    let (pos, why) = decide(b, bs, Position { price: paid / sh, ..base.clone() }, paid + fees, sh);
                     if pos.is_some() {
                         *s.open.entry(key(&wallet, &token)).or_default() += 1;
                     } else {
@@ -781,7 +799,7 @@ pub async fn report(url: &str, args: &[String]) -> Result<()> {
     }
 
     println!("\nThe verdict (README): after {VERDICT_DAYS} days a score works if its mean place among the 10 random draws \
-              (0-10, a random pick 5) is {VERDICT_PLACE}+ over its 45 books, and over 5 on {VERDICT_SIZES} of the 5 sizes.\n");
+              (0-10, a random pick 5) is {VERDICT_PLACE}+ over its 90 books, and over 5 on {VERDICT_SIZES} of the 5 sizes.\n");
     print!("{:10}", "score");
     for n in SIZES {
         print!(" {n:>5}");
@@ -823,6 +841,21 @@ pub async fn report(url: &str, args: &[String]) -> Result<()> {
             "no".into()
         };
         println!(" {m:6.2} {:+8.1}% {:6.1}%  {verdict}", rets * 100.0, dds * 100.0);
+    }
+
+    println!("\nThe buy cap: mean return / median drawdown at 3% and 10% over the trader's price.");
+    println!("{:10} {:>17} {:>17}", "", "C3", "C10");
+    for random in [false, true] {
+        let cell = |narrow: bool| {
+            let v: Vec<&Seen> = books
+                .iter()
+                .filter(|b| b.narrow == narrow && matches!(b.score, Score::Random(_)) == random)
+                .map(|b| &seen[b.name.as_str()])
+                .collect();
+            let r = v.iter().map(|x| x.ret).sum::<f64>() / v.len() as f64;
+            format!("{:+7.1}% / {:5.1}%", r * 100.0, median(v.iter().map(|x| x.dd).collect()) * 100.0)
+        };
+        println!("{:10} {:>17} {:>17}", if random { "random" } else { "scores" }, cell(true), cell(false));
     }
 
     println!("\nSizing: mean return / median drawdown, the scores' books and the random draws'.");
@@ -880,18 +913,18 @@ mod tests {
     #[test]
     fn grid() {
         let b = books();
-        assert_eq!(b.len(), 990);
-        assert!(b.iter().any(|x| x.name == "LCB_20_R0.5_E20"));
-        assert!(b.iter().any(|x| x.name == "RANDOM7_50_R1_E50"));
-        assert!(b.iter().any(|x| x.name == "COMBO_100_R2_E100"));
-        assert_eq!(b.iter().map(|x| &x.name).collect::<HashSet<_>>().len(), 990);
+        assert_eq!(b.len(), 1980);
+        assert!(b.iter().any(|x| x.name == "LCB_20_R0.5_E20_C3" && x.narrow));
+        assert!(b.iter().any(|x| x.name == "RANDOM7_50_R1_E50_C10" && !x.narrow));
+        assert!(b.iter().any(|x| x.name == "COMBO_100_R2_E100_C10"));
+        assert_eq!(b.iter().map(|x| &x.name).collect::<HashSet<_>>().len(), 1980);
         assert_eq!(fmt_time(1791676800.0 + 3723.0), "2026-10-11 01:02");
     }
 
     #[test]
     fn caps() {
         // 2% a stake, an event at most 20%: $200 a position of $10,000.
-        let b = Book { name: "T".into(), score: Score::Pnl, size: 10, stake: 0.02, event_cap: 0.2 };
+        let b = Book { name: "T".into(), score: Score::Pnl, size: 10, stake: 0.02, event_cap: 0.2, narrow: false };
         let mut s = BookState::default();
         let mut go = |s: &mut BookState, w: &str, m: &str, e: &str| decide(&b, s, pos(w, m, e), 1.0, 2.0);
         let (p, why) = go(&mut s, "a", "m1", "e1");

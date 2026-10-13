@@ -7,6 +7,10 @@
 //!          read again a second later and, if back under the cap, the rest is taken (the live
 //!          executor's single retry). A miss is also priced uncapped ("shadow"), to see what
 //!          the cap saved or cost.
+//!   wide   the wallets the allocator may pick (`wide`: the backtest's copy in profit) are
+//!          bought with a cap of `WIDE_CAP` (10%) instead; the same book is also filled at
+//!          `NARROW_CAP` (3%, with its own retry) and kept as `narrow`: the allocator's books
+//!          take one or the other, so the paper tells what the wider cap brings.
 //!   once   one buy per wallet and market in `market_gap_s` (pieces of one order within
 //!          `join_s` are one trade; wallets looping both sides of a market take one copy).
 //!          Each buy event keeps the trader's order in dollars seen by then (`wallet_usd`).
@@ -47,6 +51,9 @@ use crate::stream::{Seen, Source};
 /// The pieces of an order that count to its size: within this many seconds of the first (what
 /// the copier has seen by the time its own order lands).
 pub const ORDER_S: f64 = 2.0;
+/// The buy caps of the wallets in `wide`: the paper's, and the one filled alongside.
+pub const WIDE_CAP: f64 = 0.10;
+pub const NARROW_CAP: f64 = 0.03;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Lot {
@@ -98,6 +105,8 @@ pub struct Engine {
     /// The wallets whose buys are copied, when not every wallet followed: the others are
     /// followed only for the sales of the lots held.
     pub buyers: Mutex<Option<HashSet<String>>>,
+    /// The wallets bought at `WIDE_CAP`, with a `NARROW_CAP` fill alongside (paper only).
+    pub wide: Mutex<HashSet<String>>,
 }
 
 fn fill_json(f: &Fill) -> serde_json::Value {
@@ -141,6 +150,7 @@ impl Engine {
             cash: Mutex::new(0.0),
             swept: Mutex::new(HashSet::new()),
             buyers: Mutex::new(None),
+            wide: Mutex::new(HashSet::new()),
         }))
     }
 
@@ -301,7 +311,11 @@ impl Engine {
             }
         };
         let book_at = now();
-        let cap = fill::buy_cap(t.price, book.tick, self.cfg.buy_cap_pct, self.cfg.buy_cap_min_ticks, self.cfg.buy_cap_abs);
+        let wide = self.live.is_none() && self.wide.lock().await.contains(&t.wallet);
+        let cap_at = |pct: f64| fill::buy_cap(t.price, book.tick, pct, self.cfg.buy_cap_min_ticks, self.cfg.buy_cap_abs);
+        let cap = cap_at(if wide { WIDE_CAP } else { self.cfg.buy_cap_pct });
+        let narrow_cap = wide.then(|| cap_at(NARROW_CAP));
+        let mut narrow = narrow_cap.map(|c| fill::buy(&book.asks, stake, c, fee));
         let mut retried = false;
         let mut order = serde_json::Value::Null;
         let mut missed = "cap";
@@ -338,16 +352,25 @@ impl Engine {
         } else {
             f = fill::buy(&book.asks, stake, cap, fee);
         }
-        if self.live.is_none() && f.usd < stake * 0.5 {
-            // The live executor's single retry once the FAK came back short.
+        let short = |f: &Fill| f.usd < stake * 0.5;
+        if self.live.is_none() && (short(&f) || narrow.as_ref().is_some_and(short)) {
+            // The live executor's single retry once the FAK came back short (each cap its own).
             tokio::time::sleep(Duration::from_secs(1)).await;
             if let Ok(b2) = self.api.book(&t.token).await {
-                if b2.asks.first().is_some_and(|a| a.0 <= cap) {
-                    retried = true;
+                let top_up = |f: &mut Fill, cap: f64| {
                     let more = fill::buy(&b2.asks, stake - f.usd, cap, fee);
                     f.shares += more.shares;
                     f.usd += more.usd;
                     f.fee += more.fee;
+                };
+                if short(&f) && b2.asks.first().is_some_and(|a| a.0 <= cap) {
+                    retried = true;
+                    top_up(&mut f, cap);
+                }
+                if let (Some(n), Some(c)) = (narrow.as_mut(), narrow_cap) {
+                    if short(n) && b2.asks.first().is_some_and(|a| a.0 <= c) {
+                        top_up(n, c);
+                    }
                 }
             }
         }
@@ -385,6 +408,7 @@ impl Engine {
             "fill": fill_json(&f), "vs_wallet_bps": vs, "retried": retried,
             "missed": if filled { serde_json::Value::Null } else { json!(missed) },
             "shadow": shadow.map(|s| fill_json(&s)), "order": order,
+            "narrow": narrow.map(|n| json!({"cap": narrow_cap, "fill": fill_json(&n)})),
         })).await;
         if filled {
             // The wallet's position once the API has caught up: the reference for its sales.

@@ -5,7 +5,8 @@ done and compares.
   picks     every entry and refusal is of a wallet the book picked that day (or the day before)
   complete  every paper buy of a picked wallet is in the book: an entry or a refusal
   sizes     stake = the book's share of its capital (or cut, never under 1/8 nor $1); the capital
-            at entry = $10,000 + the result of the positions closed before
+            at entry = $10,000 + the result of the positions closed before; the shares = the
+            book's fill (C3: the paper's at the 3% cap, C10: its own) scaled to the stake
   caps      at each entry, with the positions open then (each at the share still open): 2 per
             wallet and outcome, everything 100%, the event the book's limit, the wallet 20%
   pnl       each position's dollars back from the paper's sales and settlement, to the cent
@@ -90,8 +91,15 @@ def picks_of(prior, day):
 
 
 def parse(book):
-    s, n, r, e = book.rsplit('_', 3)
+    s, n, r, e, c = book.rsplit('_', 4)
     return s, int(n), float(r[1:]) / 100, float(e[1:]) / 100
+
+
+def fill_of(book, data):
+    """The paper's fill a book takes: C3 the one at the narrow cap (the paper's own without one)."""
+    f = (data.get('narrow') or {}).get('fill') if book.endswith('_C3') and isinstance(data.get('narrow'), dict) else None
+    f = f or data.get('fill') or {}
+    return (f.get('usd') or 0) + (f.get('fee') or 0), f.get('shares') or 0
 
 
 def main():
@@ -143,12 +151,12 @@ def main():
     for e in events:
         if e[2] != 'buy':
             continue
-        f = (e[5] or {}).get('fill') or {}
-        if (f.get('usd') or 0) + (f.get('fee') or 0) <= 0 or (f.get('shares') or 0) <= 0:
-            continue
         day = int(e[1] // 86400)
         for b in books_all():
             s, n, _, _ = parse(b)
+            cost, sh = fill_of(b, e[5] or {})
+            if cost <= 0 or sh <= 0:
+                continue
             if e[3] in picked(day)[(s, n)]:
                 k = (b, e[0])
                 if k not in trades and k not in opened and k not in decisions:
@@ -238,6 +246,9 @@ def main():
             stake, shares0, cap0 = (row[8], row[9], row[7]) if isinstance(row, tuple) else (row['stake'], row['shares0'], row['capital'])
             if abs(cap0 - capital) > EPS:
                 bad('sizes', f'{b}: entry {i} at capital ${cap0:.2f}, recomputed ${capital:.2f}')
+            cost, sh = fill_of(b, e[5] or {})
+            if cost <= 0 or abs(shares0 - stake / cost * sh) > 1e-6 * max(1, shares0):
+                bad('sizes', f'{b}: entry {i} {shares0:.4f} shares, its fill gives {stake / cost * sh if cost > 0 else 0:.4f}')
             if stake > want + EPS or stake < max(want * MIN_SHARE, MIN_USD) - EPS:
                 bad('sizes', f'{b}: entry {i} stake ${stake:.2f} for ${want:.2f} wanted')
             if stake < want - EPS and dec is None:
@@ -288,7 +299,8 @@ def books_all():
         for n in SIZES:
             for r in ['0.5', '1', '2']:
                 for e in ['20', '50', '100']:
-                    out.append(f'{s}_{n}_R{r}_E{e}')
+                    for c in ['3', '10']:
+                        out.append(f'{s}_{n}_R{r}_E{e}_C{c}')
     return out
 
 
