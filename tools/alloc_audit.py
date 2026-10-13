@@ -7,7 +7,7 @@ done and compares.
   sizes     stake = the book's share of its capital (or cut, never under 1/8 nor $1); the capital
             at entry = $10,000 + the result of the positions closed before
   caps      at each entry, with the positions open then (each at the share still open): 2 per
-            market, everything 100%, the event the book's limit, the wallet 20%
+            wallet and outcome, everything 100%, the event the book's limit, the wallet 20%
   pnl       each position's dollars back from the paper's sales and settlement, to the cent
   balance   the state's and every status row's capital = $10,000 + the closed positions' result
 
@@ -17,7 +17,7 @@ from collections import defaultdict
 import psycopg2
 
 GEN = 1
-DEPOSIT, TOTAL_CAP, TRADER_CAP, MARKET_POSITIONS = 10_000.0, 1.0, 0.2, 2
+DEPOSIT, TOTAL_CAP, TRADER_CAP, WALLET_OUTCOME = 10_000.0, 1.0, 0.2, 2
 MIN_SHARE, MIN_USD, MIN_MARKETS, DD_FLOOR, PF_MAX = 1 / 8, 1.0, 20, 1.0, 50.0
 SIZES = [10, 20, 30, 50, 100]
 RATED = ['PNL', 'PNL30', 'LCB', 'EXPDD', 'PNLSQRTN', 'TSTAT', 'PF', 'SHARPE', 'SORTINO', 'CALMAR', 'WEEKS']
@@ -225,7 +225,9 @@ def main():
             risk = lambda f: sum(p['stake'] * p['shares'] / p['shares0'] for p in pos.values() if f(p))
             if row is None:
                 # refused: there must have been no room
-                if dec[3] == 'MARKET_POSITIONS_CAP':
+                if dec[3] == 'ADD_CAP':
+                    if sum(1 for p in pos.values() if p['wallet'] == e[3] and p['token'] == e[4]) < WALLET_OUTCOME:
+                        bad('caps', f'{b}: refused {i} (ADD_CAP) with under 2 positions of the wallet in the outcome')
                     continue
                 rooms = [TOTAL_CAP * capital - risk(lambda p: True), TRADER_CAP * capital - risk(lambda p: p['wallet'] == e[3])]
                 if min(rooms) >= max(want * MIN_SHARE, MIN_USD) and dec[3] != 'EVENT_CAP':
@@ -240,8 +242,8 @@ def main():
                 bad('sizes', f'{b}: entry {i} stake ${stake:.2f} for ${want:.2f} wanted')
             if stake < want - EPS and dec is None:
                 bad('sizes', f'{b}: entry {i} cut to ${stake:.2f} of ${want:.2f}, no decision row')
-            if sum(1 for p in pos.values() if p['market'] == market) >= MARKET_POSITIONS:
-                bad('caps', f'{b}: entry {i} a 3rd position in market {market[:12]}')
+            if sum(1 for p in pos.values() if p['wallet'] == e[3] and p['token'] == e[4]) >= WALLET_OUTCOME:
+                bad('caps', f'{b}: entry {i} a 3rd position of {e[3][:10]} in one outcome')
             for name, used, cap in [('total', risk(lambda p: True), TOTAL_CAP), ('event', risk(lambda p: p['event'] == event), event_cap),
                                     ('wallet', risk(lambda p: p['wallet'] == e[3]), TRADER_CAP)]:
                 if used + stake > cap * capital + EPS:

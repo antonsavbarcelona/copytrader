@@ -81,11 +81,12 @@ every stake and limit.
 
 **An entry.** A buy the paper copied of a picked wallet, each book apart (capital = $10,000 +
 the closed positions' result; a position's risk = its stake times the share still open):
-2 positions in the market already -> `MARKET_POSITIONS_CAP`; the stake is cut to the room under
+the wallet's entry and one add in this outcome open already -> `ADD_CAP` (other wallets in it
+are apart); the stake is cut to the room under
 everything open <= 100% (`TOTAL_CAP`), the event <= the book's limit (`EVENT_CAP`) and the
 wallet <= 20% (`TRADER_CAP`); under 1/8 of the stake or $1 it is refused. The position is the
 paper's buy scaled to the stake, sold as the paper sells (the same share, at its price) and
-paid out at the settlement. No stop: a market settles in a jump. A wallet that leaves the
+paid out at the settlement. No stop: a lost outcome burns the stake, which is the risk. A wallet that leaves the
 picks gets no new entries; its open positions run to the end.
 
 **The verdict** (fixed before the start, 2026-10-13). Each score's book gets a place among

@@ -28,7 +28,8 @@
 //!
 //! A buy of a picked wallet, each book apart (capital = $10,000 + the closed positions' result;
 //! a position's risk = its stake times the share of it still open):
-//!   1. 2 positions open in the market already -> MARKET_POSITIONS_CAP
+//!   1. the wallet's entry and one add in this outcome open already -> ADD_CAP (2 a wallet and
+//!      outcome; other wallets in it are apart)
 //!   2. the stake = the book's share of the capital, cut to the room left under the caps:
 //!      everything open <= 100% (TOTAL_CAP), the event <= the book's limit (EVENT_CAP), the
 //!      wallet <= 20% (TRADER_CAP); under 1/8 of the stake or $1 -> refused
@@ -64,7 +65,8 @@ const EVENT_CAPS: [f64; 3] = [0.2, 0.5, 1.0];
 const RANDOMS: u8 = 10;
 const TOTAL_CAP: f64 = 1.0;
 const TRADER_CAP: f64 = 0.2;
-const MARKET_POSITIONS: usize = 2;
+/// One wallet's positions in one outcome: its entry and one add.
+const WALLET_OUTCOME: usize = 2;
 /// A stake cut under this share of the book's is refused, as is one under $1.
 const MIN_SHARE: f64 = 1.0 / 8.0;
 const MIN_USD: f64 = 1.0;
@@ -384,8 +386,8 @@ fn decide(b: &Book, s: &mut BookState, p: Position, paper_cost: f64, paper_share
     -> (Option<Position>, Option<(&'static str, f64, f64)>) {
     let capital = s.capital();
     let want = b.stake * capital;
-    if s.positions.iter().filter(|x| x.market == p.market).count() >= MARKET_POSITIONS {
-        return (None, Some(("MARKET_POSITIONS_CAP", want, 0.0)));
+    if s.positions.iter().filter(|x| x.wallet == p.wallet && x.token == p.token).count() >= WALLET_OUTCOME {
+        return (None, Some(("ADD_CAP", want, 0.0)));
     }
     let open = |f: &dyn Fn(&Position) -> bool| s.positions.iter().filter(|x| f(x)).map(Position::risk).sum::<f64>();
     let rooms = [
@@ -895,10 +897,12 @@ mod tests {
         let (p, why) = go(&mut s, "a", "m1", "e1");
         assert!(why.is_none() && (p.unwrap().stake - 200.0).abs() < 1e-9);
         assert_eq!(s.positions[0].shares, 400.0);
-        go(&mut s, "b", "m1", "e1");
-        assert_eq!(go(&mut s, "c", "m1", "e1").1.unwrap().0, "MARKET_POSITIONS_CAP");
-        // e1 holds $400 of its $2,000; then 8 more positions fill the event.
-        for i in 0..8 {
+        // The wallet's add in the outcome is taken, a third entry not; another wallet's is.
+        assert!(go(&mut s, "a", "m1", "e1").0.is_some());
+        assert_eq!(go(&mut s, "a", "m1", "e1").1.unwrap().0, "ADD_CAP");
+        assert!(go(&mut s, "b", "m1", "e1").0.is_some());
+        // e1 holds $600 of its $2,000; then 7 more positions fill the event.
+        for i in 0..7 {
             assert!(go(&mut s, &format!("w{i}"), &format!("n{i}"), "e1").0.is_some());
         }
         assert_eq!(go(&mut s, "z", "q", "e1").1.unwrap().0, "EVENT_CAP");

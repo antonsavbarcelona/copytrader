@@ -26,3 +26,17 @@ last price).
 
 Days and copies in the walk-forward are of a 60-day lookback, the prior's of 90: the gates
 scale by 1.5 (20 days -> 30, 30 copies -> 45).
+
+## The allocator's grid on the backtest (generation 1)
+
+1. `py grid_picks.py 7`: each day's walk-forward picks of the 22 scores and draws x 5 sizes, on
+   the copies entered before the day - 7.
+2. `py market_meta.py grid_picks_7.pkl`: each market those copies are in, its close time and
+   event (gamma).
+3. `FIXED=1 py grid_bt.py 7` (`MINP=0.05`: without the copies under 0.05): the 990 books under
+   the allocator's rules, each score's place among the 10 random draws.
+
+2026-10-13: every score came out 9-10 of 10, the books +500-2,300% in 60 days. Not believed:
+the same picked wallets on the same days (Oct 3-10) made +29.9% a copy in the backtest and
+-16.5% on paper (-96% under 0.05), where only 26% of their buys filled. The backtest's copy
+model has to be calibrated on the paper before its grid means anything.
