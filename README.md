@@ -47,55 +47,60 @@ wallets/picks.txt --alloc-prior wallets/backtest_stats.csv`:
   (the backtest's 172 picks), the trade stream sees the rest. Round one and the trials stand
   still, and live buys nothing new: it only follows its held lots to their sale or the
   settlement and redeems them.
-- The allocator (`src/allocator.rs`) keeps 138 virtual books over those copies, each with its
-  own $1000 (details below). Decisions go to `alloc`, the rankings to `alloc_rank`, every
-  book's balance every 6 h to `alloc_snap`.
+- The allocator (`src/allocator.rs`) keeps 990 virtual books of $10,000 over those copies
+  (details below): every closed position in `alloc_trades`, the cut and refused entries in
+  `alloc_decisions`, every book's status each hour in `alloc_status`.
 
-### The allocator's books
+### The allocator, generation 1 (the scheme of hl-copytrader's generation 4)
 
-**What a book copies.** Every buy the paper copied of the wallets it picked (one per wallet and
-market in 6 h), whatever the trader's size; the event keeps the trader's order in dollars (its
-fills of one outcome within 2 s) as `wallet_usd`. The prior, the backtest's per wallet sums,
-counts copies by the same rule (`research/build2.py`), so a wallet is ranked on what the book
-copies.
+**Who is picked.** Only the 90-day backtest of the copy (`wallets/backtest_stats.csv`, from
+`research/build2.py` then `research/stats.py`): our simulated copy's result, not the trader's.
+The paper does not enter the picks. One filter for all: the copy made money (3,412 of 14,254;
+all the copies together lost 3.4%). Each score's own filter is only what it cannot be computed
+without: 20+ distinct markets for the scores that divide by risk, by the copies or lean on time
+(3,249 wallets); none for PNL and PNL30. The picks are made each day (the random draws change).
 
-**Who a book copies.** No filter is common. Each pick has its own gate (a minimum record),
-ranks the wallets through it by its score, daily, on the prior pooled with the paper's closed
-lots of 30 days, and takes its top N. One rule chose each score's gate (`research/`): of nine
-gates, the one with the best worst result over lags 7 and 21 days, both halves of the period
-and top 10 and 30; within a point of it, the widest. The gates, of 14,254 wallets:
+| score | formula |
+|---|---|
+| PNL | the copy's result |
+| PNL30 | of the copies entered in the backtest's last 30 days |
+| LCB | mean return - 2 sd / sqrt(n) |
+| EXPDD | (pnl / n) / max(drawdown, $1) |
+| PNLSQRTN | mean return * sqrt(n) |
+| TSTAT | mean / sd * sqrt(n) |
+| PF | wins / losses, at most 50 |
+| SHARPE, SORTINO | of the daily result over the 90 days, a year |
+| CALMAR | pnl / max(drawdown, $1) |
+| WEEKS | the share of weeks in profit |
+| COMBO | the mean percentile of the 11 above |
+| RANDOM1..10 | ten draws of those in profit, new each day: the control |
 
-| score | gate | wallets |
-|---|---|---|
-| EXPDD, TSTAT, PNL, PNLSQRTN | bets on 30+ of the backtest's 90 days | 9,038 |
-| PF | 45+ copies | 12,520 |
-| CALMAR, SHRUNK | none | 14,254 |
+**The grid**: 22 picks x 10/20/30/50/100 wallets x a stake of 0.5/1/2% of the capital x an
+event limit of 20/50/100% = 990 books (`LCB_20_R0.5_E20`). One pick takes the same wallets at
+every stake and limit.
 
-The gates were chosen on the backtest of orders of $100+ and kept when the books went back to
-copying every buy. Each pick but the random ones and EXPDD_ANY_30 also
-runs as a `_STRICT` twin with the allocator's first gate (100+ copies at ROI > 5%, pooled ROI
-above 0; up to 1,189 wallets): soft against strict on paper.
+**An entry.** A buy the paper copied of a picked wallet, each book apart (capital = $10,000 +
+the closed positions' result; a position's risk = its stake times the share still open):
+2 positions in the market already -> `MARKET_POSITIONS_CAP`; the stake is cut to the room under
+everything open <= 100% (`TOTAL_CAP`), the event <= the book's limit (`EVENT_CAP`) and the
+wallet <= 20% (`TRADER_CAP`); under 1/8 of the stake or $1 it is refused. The position is the
+paper's buy scaled to the stake, sold as the paper sells (the same share, at its price) and
+paid out at the settlement. No stop: a market settles in a jump. A wallet that leaves the
+picks gets no new entries; its open positions run to the end.
 
-The picks: EXPDD 10/30/50, CALMAR 10/30, PNL 10/30, PNLSQRTN 10/30, PF 30/50, TSTAT 30, SHRUNK 30,
-on the bets bought at 0.20-0.50 PF_MID_30 and CALMAR_MID_30, below 0.95 PF_NO95_30 and
-CALMAR_NO95_10/30, below 0.50 PF_DOG_30; the controls RANDOM_10/30/50 (from every wallet),
-RANDOM_ELIG_30 and ELIGIBLE (the 30-day gate's) and EXPDD_ANY_30 (EXPDD with no gate). 25
-picks and 21 strict twins, each in three modes of risk: `W4` (4 copies of a wallet open at
-most, an event 3, a copy = $1000 / the book's ceiling of copies open), `W2` (the same at 2)
-and `1USD` ($1 a copy, no caps): 138 books.
-
-**How a book is judged** (fixed before the results). `copytrader alloc` reports each book
-since its rules began: the closed copies' ROI with its 95% bounds and in each half of the
-period, the result with the open lots at today's price, the worst drawdown of the balance
-(from the 6-hourly snapshots); then soft gates against strict, scores against RANDOM of as
-many wallets, the gate on EXPDD, and the modes. A book is worth following when, after **14+
-days**, it has **300+ closed copies**, the **95% lower bound of its ROI is above 0**, its ROI
-is **above its RANDOM's** of as many wallets, **both halves** are in profit and its **drawdown
-stayed under $200**; of those, the highest lower bound first. One week is not enough: at a few
-hundred copies a book's ROI is known to about +-5-10 points.
+**The verdict** (fixed before the start, 2026-10-13). Each score's book gets a place among
+the 10 random draws of the same size, stake and limit: how many of them it is ahead of by
+return (open positions at the market's price), 0-10, a random pick 5 on average. After **21
+days** a score works if its **mean place over its 45 books is 7.5+** and **over 5 on 4 of the
+5 sizes**. One lucky cell is not believed: of 540 scored books some beat the draws by chance.
+The stakes and limits are compared apart, by return and drawdown, for the scores and the
+draws.
 
 ```
-DATABASE_URL=postgresql://... target/release/copytrader alloc    # each book in dollars
+DATABASE_URL=postgresql://... target/release/copytrader alloc                # places and verdicts
+DATABASE_URL=postgresql://... target/release/copytrader alloc --score LCB    # its 45 books
+DATABASE_URL=postgresql://... target/release/copytrader alloc --detail LCB_20_R0.5_E20
+DATABASE_URL=postgresql://... py tools/alloc_audit.py   # picks, entries, sizes, caps, pnl, balance by another way
 ```
 
 ## Round one: the big players

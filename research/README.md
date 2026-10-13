@@ -10,13 +10,17 @@ last price).
 2. `build2.py ../wallets/all.txt`: the prior as the books copy. A trader's order is its fills of
    one outcome within 2 s of the first (what the copier has seen when its own order lands);
    one copy per wallet and market in 6 h (as the engine does). Writes `rows2.pkl` (every
-   copy) and `prior2.csv` (= `wallets/backtest_stats.csv`).
-3. `ROWS=rows2.pkl SUF=_v2 py alloc_gates.py 7` and `... 21`: the walk-forward of 7 scores
+   copy).
+3. `stats.py`: the per wallet sums the allocator reads, from `rows2.pkl` (`prior.csv` =
+   `wallets/backtest_stats.csv`): copies, markets, result, drawdown, PNL30, Sharpe, Sortino,
+   weeks in profit. (Steps 4-6 chose the gates and
+   ceilings of the allocator before generation 1; it does not use them.)
+4. `ROWS=rows2.pkl SUF=_v2 py alloc_gates.py 7` and `... 21`: the walk-forward of 7 scores
    under 9 gates (each day, the stats of the 60 days before the lag, the top 10 / 30 copied).
-4. `SUF=_v2 py gate_pick.py`: one rule picks each score's gate: the best worst cell (lags 7
+5. `SUF=_v2 py gate_pick.py`: one rule picks each score's gate: the best worst cell (lags 7
    and 21, first and second half, top 10 and 30); within 1 point, the widest gate; a gate
    that let nobody through in some cell cannot be judged and is left out.
-5. `py alloc_ceil2.py`: the prod picks with those gates, day by day, under the W4 / W2 caps:
+6. `py alloc_ceil2.py`: the prod picks with those gates, day by day, under the W4 / W2 caps:
    each book's ceiling of copies open (the worse lag's peak + 30%) and its history at the
    formula stake.
 

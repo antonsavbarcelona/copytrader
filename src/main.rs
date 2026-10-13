@@ -4,7 +4,7 @@
 //!     copytrader run    [--data DIR] [--stake 1] [--cap 0.02] [--sell-floor 0.05] [--market-gap-h 6]
 //!                       [--top 10] [--no-scout] [--polyfox] [--wallets-file F] [--poll-file F]
 //!     copytrader report [--data DIR] [--hours 24] [--live]
-//!     copytrader alloc                     (the allocator's books so far; needs DATABASE_URL)
+//!     copytrader alloc [--score X | --detail BOOK]   (the allocator's verdict; needs DATABASE_URL)
 //!     copytrader check                     (the live keys: account and cash, no order)
 //!     copytrader test-trade TOKEN [USD]    (a real buy of USD, default 1, then its sale)
 //!     copytrader scout                     (round one now: who passes; read only)
@@ -26,7 +26,7 @@
 //! to their sale or settlement and redeems them.
 //!
 //! With --alloc-prior (the backtest's per wallet sums) the allocator (allocator.rs) ranks the wallets daily
-//! and keeps virtual portfolios over the paper's copies: which wallets to copy, and how much.
+//! and keeps 990 virtual portfolios over the paper's copies: which wallets to copy, and how much.
 
 mod allocator;
 mod api;
@@ -242,7 +242,7 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     if cmd == "alloc" {
-        return allocator::report(&std::env::var("DATABASE_URL").context("DATABASE_URL")?).await;
+        return allocator::report(&std::env::var("DATABASE_URL").context("DATABASE_URL")?, &rest).await;
     }
     if cmd == "test-trade" {
         return test_trade(rest.first().cloned().context("test-trade TOKEN [USD]")?, rest.get(1).cloned()).await;
@@ -408,13 +408,7 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         (Some(url), Some(path)) => match allocator::read_prior(path) {
             Ok(prior) => {
                 log!("alloc: prior of {} wallets from {}", prior.len(), path.display());
-                // The random books draw from every wallet followed, not only those with a record.
-                let everyone: Vec<String> = match cfg.wallets_file.as_deref().map(read_wallets) {
-                    Some(Ok(set)) => set.into_iter().collect(),
-                    _ => prior.keys().cloned().collect(),
-                };
-                log!("alloc: random books draw from {} wallets", everyone.len());
-                tokio::spawn(allocator::run(url.clone(), api.clone(), prior, everyone));
+                tokio::spawn(allocator::run(url.clone(), api.clone(), prior));
             }
             Err(e) => log!("alloc: OFF, {} not read: {e}", path.display()),
         },

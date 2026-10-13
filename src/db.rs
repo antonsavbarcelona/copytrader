@@ -100,6 +100,60 @@ CREATE TABLE IF NOT EXISTS alloc_snap (
     open_value  float8 NOT NULL,
     PRIMARY KEY (at, book)
 );
+-- The allocator's generations (allocator.rs): every closed position of a book, the entries
+-- cut or refused, every book's status each hour. (alloc, alloc_rank, alloc_snap: before them.)
+CREATE TABLE IF NOT EXISTS alloc_trades (
+    gen       int NOT NULL,
+    book      text NOT NULL,
+    entry_id  bigint NOT NULL,
+    close_id  bigint NOT NULL,
+    wallet    text NOT NULL,
+    token     text NOT NULL,
+    market    text NOT NULL,
+    event     text NOT NULL,
+    opened_at timestamptz NOT NULL,
+    closed_at timestamptz NOT NULL,
+    price     float8 NOT NULL,
+    capital   float8 NOT NULL,
+    stake     float8 NOT NULL,
+    shares    float8 NOT NULL,
+    back      float8 NOT NULL,
+    pnl       float8 NOT NULL,
+    r         float8 NOT NULL,
+    hold_h    float8 NOT NULL,
+    reason    text NOT NULL,
+    PRIMARY KEY (gen, book, entry_id)
+);
+CREATE TABLE IF NOT EXISTS alloc_decisions (
+    gen      int NOT NULL,
+    at       timestamptz NOT NULL,
+    book     text NOT NULL,
+    event_id bigint NOT NULL,
+    wallet   text NOT NULL,
+    token    text NOT NULL,
+    market   text NOT NULL,
+    event    text NOT NULL,
+    wanted   float8 NOT NULL,
+    granted  float8 NOT NULL,
+    reason   text NOT NULL,
+    PRIMARY KEY (gen, book, event_id)
+);
+CREATE TABLE IF NOT EXISTS alloc_status (
+    gen       int NOT NULL,
+    at        timestamptz NOT NULL,
+    last_id   bigint NOT NULL,
+    book      text NOT NULL,
+    capital   float8 NOT NULL,
+    equity    float8 NOT NULL,
+    open_risk float8 NOT NULL,
+    event_max float8 NOT NULL,
+    positions bigint NOT NULL,
+    entries   bigint NOT NULL,
+    cuts      bigint NOT NULL,
+    refusals  bigint NOT NULL,
+    closed    bigint NOT NULL,
+    PRIMARY KEY (gen, at, book)
+);
 CREATE OR REPLACE VIEW buys AS
 SELECT id, at, wallet, title, data->>'phase' AS phase, data->>'source' AS source,
        data->>'missed' AS missed, (data->>'wallet_price')::float8 AS wallet_price,
