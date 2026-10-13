@@ -227,12 +227,70 @@ async fn apply(c: &Client, w: &Write) -> Result<()> {
     Ok(())
 }
 
-/// Applies the writes in order; on an error reconnects and retries the same write.
+/// The events of one table, one statement.
+async fn insert_events(c: &Client, evs: &[&Value], live: bool) -> Result<()> {
+    let s = |k: &str| evs.iter().map(|ev| ev[k].as_str().map(str::to_string)).collect::<Vec<Option<String>>>();
+    let at: Vec<f64> = evs.iter().map(|ev| ev["at"].as_f64().unwrap_or(0.0)).collect();
+    let kind: Vec<String> = s("kind").into_iter().map(Option::unwrap_or_default).collect();
+    let data: Vec<Value> = evs.iter().map(|ev| (*ev).clone()).collect();
+    c.execute(
+        &format!("INSERT INTO {} (at, kind, wallet, token, condition, title, data)
+                  SELECT to_timestamp(a), k, w, t, c, ti, d
+                  FROM unnest($1::float8[], $2::text[], $3::text[], $4::text[], $5::text[], $6::text[], $7::jsonb[])
+                       WITH ORDINALITY AS u(a, k, w, t, c, ti, d, o) ORDER BY o", events_table(live)),
+        &[&at, &kind, &s("wallet"), &s("token"), &s("condition"), &s("title"), &data],
+    )
+    .await?;
+    Ok(())
+}
+
+/// What is queued, applied in order: the events of a run one statement a table; of the state
+/// snapshots of one copy only the last (each replaces the one before).
+async fn apply_all(c: &Client, ws: &[Write]) -> Result<()> {
+    let last_state: Vec<usize> = [false, true]
+        .iter()
+        .filter_map(|l| ws.iter().rposition(|w| matches!(w, Write::State(_, live) if live == l)))
+        .collect();
+    let mut i = 0;
+    while i < ws.len() {
+        match &ws[i] {
+            Write::Event(_, live) => {
+                let mut evs = Vec::new();
+                while let Some(Write::Event(ev, l)) = ws.get(i) {
+                    if l != live || evs.len() >= 2000 {
+                        break;
+                    }
+                    evs.push(ev);
+                    i += 1;
+                }
+                insert_events(c, &evs, *live).await?;
+                continue;
+            }
+            Write::State(..) if !last_state.contains(&i) => {}
+            w => apply(c, w).await?,
+        }
+        i += 1;
+    }
+    Ok(())
+}
+
+/// Applies the writes in order, all that are queued at once; on an error reconnects and
+/// retries them. Commits do not wait for the disk (synchronous_commit off): a crash of the
+/// database loses at most its last fraction of a second, a write a row at a time fell behind.
 pub async fn writer(url: String, mut client: Option<Client>, mut rx: mpsc::UnboundedReceiver<Write>) {
-    while let Some(w) = rx.recv().await {
+    let mut fast = false;
+    while let Some(first) = rx.recv().await {
+        let mut ws = vec![first];
+        while ws.len() < 20_000 {
+            match rx.try_recv() {
+                Ok(w) => ws.push(w),
+                Err(_) => break,
+            }
+        }
         let mut wait = 1.0;
         loop {
             if client.as_ref().is_none_or(|c| c.is_closed()) {
+                fast = false;
                 client = match connect(&url).await {
                     Ok(c) => Some(c),
                     Err(e) => {
@@ -242,10 +300,13 @@ pub async fn writer(url: String, mut client: Option<Client>, mut rx: mpsc::Unbou
                 };
             }
             if let Some(c) = &client {
-                match apply(c, &w).await {
+                if !fast {
+                    fast = c.batch_execute("SET synchronous_commit = off").await.is_ok();
+                }
+                match apply_all(c, &ws).await {
                     Ok(()) => break,
                     Err(e) => {
-                        log!("db: write failed: {e}");
+                        log!("db: write of {} failed: {e}", ws.len());
                         client = None;
                     }
                 }

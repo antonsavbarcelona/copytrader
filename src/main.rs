@@ -496,7 +496,8 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
             }
         }
         tick += 1;
-        save_all(tick % 4 == 0).await;
+        // The local file every 15 s, the database every 5 min (the paper's state is tens of MB).
+        save_all(tick % 20 == 0).await;
         if let Some((name, _)) = tasks.iter().find(|(_, h)| h.is_finished()) {
             save_all(true).await;
             tokio::time::sleep(Duration::from_secs(3)).await;

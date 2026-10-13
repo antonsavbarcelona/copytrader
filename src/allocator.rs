@@ -41,7 +41,7 @@
 //!
 //! Tables: `alloc_trades` every closed position, `alloc_decisions` only the cut and refused
 //! ones, `alloc_status` every book each hour. Every row has the generation: new rules, new
-//! generation, the books start again. The state is saved every 5 minutes; after a restart the
+//! generation, the books start again. The state is saved every 15 minutes; after a restart the
 //! events since are read again (the rows already written are kept). `copytrader alloc` judges
 //! the scores (README).
 
@@ -79,7 +79,7 @@ const MIN_MARKETS: f64 = 20.0;
 const DD_FLOOR: f64 = 1.0;
 const PF_MAX: f64 = 50.0;
 const HOUR: f64 = 3600.0;
-const SAVE_EVERY_S: f64 = 300.0;
+const SAVE_EVERY_S: f64 = 900.0;
 /// The verdict (README): after this many days, a score's mean place among the 10 random
 /// draws at least this, and over 5 on this many of the 5 sizes.
 const VERDICT_DAYS: f64 = 21.0;
