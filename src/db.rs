@@ -61,47 +61,10 @@ CREATE TABLE IF NOT EXISTS trials (
     last         jsonb,
     weeks        jsonb NOT NULL DEFAULT '[]'
 );
--- The allocator (allocator.rs): each paper copy a book wanted, granted or which cap refused it;
--- and each day's records of the eligible wallets with their rank in each book.
-CREATE TABLE IF NOT EXISTS alloc (
-    id        bigserial PRIMARY KEY,
-    at        timestamptz NOT NULL,
-    book      text NOT NULL,
-    event_id  bigint NOT NULL,
-    wallet    text NOT NULL,
-    token     text NOT NULL,
-    event     text,
-    rank      int,
-    score     float8,
-    price     float8,
-    requested float8 NOT NULL,
-    granted   float8 NOT NULL,
-    reason    text NOT NULL
-);
-CREATE INDEX IF NOT EXISTS alloc_book ON alloc (book, wallet, token);
-CREATE UNIQUE INDEX IF NOT EXISTS alloc_once ON alloc (book, event_id);
-CREATE TABLE IF NOT EXISTS alloc_rank (
-    day    date NOT NULL,
-    wallet text NOT NULL,
-    prior  jsonb,
-    paper  jsonb,
-    ranks  jsonb NOT NULL,
-    PRIMARY KEY (day, wallet)
-);
-CREATE TABLE IF NOT EXISTS alloc_snap (
-    at          timestamptz NOT NULL,
-    book        text NOT NULL,
-    stake       float8 NOT NULL,
-    copies      bigint NOT NULL,
-    cost        float8 NOT NULL,
-    closed_cost float8 NOT NULL,
-    closed_pnl  float8 NOT NULL,
-    open_cost   float8 NOT NULL,
-    open_value  float8 NOT NULL,
-    PRIMARY KEY (at, book)
-);
+-- The allocator before its generations (138 books, 2026-10-12/13): its tables are gone.
+DROP TABLE IF EXISTS alloc, alloc_rank, alloc_snap;
 -- The allocator's generations (allocator.rs): every closed position of a book, the entries
--- cut or refused, every book's status each hour. (alloc, alloc_rank, alloc_snap: before them.)
+-- cut or refused, every book's status each hour.
 CREATE TABLE IF NOT EXISTS alloc_trades (
     gen       int NOT NULL,
     book      text NOT NULL,
