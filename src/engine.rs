@@ -9,8 +9,9 @@
 //!          the cap saved or cost.
 //!   wide   the wallets the allocator may pick (`wide`: the backtest's copy in profit) are
 //!          bought with a cap of `WIDE_CAP` (10%) instead; the same book is also filled at
-//!          `NARROW_CAP` (3%, with its own retry) and kept as `narrow`: the allocator's books
-//!          take one or the other, so the paper tells what the wider cap brings.
+//!          `NARROW_CAP` (3%, with its own retry) and kept as `narrow`; and at each cap at the
+//!          books' sizes ($50/$100/$200, `sized`): a book takes the fill of its cap and size,
+//!          as deep in the book as its order would go.
 //!   once   one buy per wallet and market in `market_gap_s` (pieces of one order within
 //!          `join_s` are one trade; wallets looping both sides of a market take one copy).
 //!          Each buy event keeps the trader's order in dollars seen by then (`wallet_usd`).
@@ -54,6 +55,9 @@ pub const ORDER_S: f64 = 2.0;
 /// The buy caps of the wallets in `wide`: the paper's, and the one filled alongside.
 pub const WIDE_CAP: f64 = 0.10;
 pub const NARROW_CAP: f64 = 0.03;
+/// The sizes the allocator's books buy at (0.5/1/2% of $10,000): the buys of the `wide` wallets
+/// are filled at each of them too, at each cap (`sized` in the buy event).
+pub const SIZED_USD: [f64; 3] = [50.0, 100.0, 200.0];
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Lot {
@@ -352,25 +356,39 @@ impl Engine {
         } else {
             f = fill::buy(&book.asks, stake, cap, fee);
         }
-        let short = |f: &Fill| f.usd < stake * 0.5;
-        if self.live.is_none() && (short(&f) || narrow.as_ref().is_some_and(short)) {
-            // The live executor's single retry once the FAK came back short (each cap its own).
+        // The allocator's books buy more than $1: the same book filled at their sizes, each cap.
+        let mut sized: Vec<(u8, f64, f64, Fill)> = Vec::new();
+        if wide {
+            for (pct, c) in [(3u8, cap_at(NARROW_CAP)), (10, cap)] {
+                for usd in SIZED_USD {
+                    sized.push((pct, usd, c, fill::buy(&book.asks, usd, c, fee)));
+                }
+            }
+        }
+        let short = |f: &Fill, usd: f64| f.usd < usd * 0.5;
+        if self.live.is_none()
+            && (short(&f, stake) || narrow.as_ref().is_some_and(|n| short(n, stake)) || sized.iter().any(|s| short(&s.3, s.1)))
+        {
+            // The live executor's single retry once the FAK came back short (each cap and size its own).
             tokio::time::sleep(Duration::from_secs(1)).await;
             if let Ok(b2) = self.api.book(&t.token).await {
-                let top_up = |f: &mut Fill, cap: f64| {
-                    let more = fill::buy(&b2.asks, stake - f.usd, cap, fee);
-                    f.shares += more.shares;
-                    f.usd += more.usd;
-                    f.fee += more.fee;
-                };
-                if short(&f) && b2.asks.first().is_some_and(|a| a.0 <= cap) {
-                    retried = true;
-                    top_up(&mut f, cap);
-                }
-                if let (Some(n), Some(c)) = (narrow.as_mut(), narrow_cap) {
-                    if short(n) && b2.asks.first().is_some_and(|a| a.0 <= c) {
-                        top_up(n, c);
+                let top_up = |f: &mut Fill, cap: f64, usd: f64| {
+                    if f.usd < usd * 0.5 && b2.asks.first().is_some_and(|a| a.0 <= cap) {
+                        let more = fill::buy(&b2.asks, usd - f.usd, cap, fee);
+                        f.shares += more.shares;
+                        f.usd += more.usd;
+                        f.fee += more.fee;
                     }
+                };
+                if short(&f, stake) && b2.asks.first().is_some_and(|a| a.0 <= cap) {
+                    retried = true;
+                }
+                top_up(&mut f, cap, stake);
+                if let (Some(n), Some(c)) = (narrow.as_mut(), narrow_cap) {
+                    top_up(n, c, stake);
+                }
+                for (_, usd, c, s) in sized.iter_mut() {
+                    top_up(s, *c, *usd);
                 }
             }
         }
@@ -409,6 +427,14 @@ impl Engine {
             "missed": if filled { serde_json::Value::Null } else { json!(missed) },
             "shadow": shadow.map(|s| fill_json(&s)), "order": order,
             "narrow": narrow.map(|n| json!({"cap": narrow_cap, "fill": fill_json(&n)})),
+            "sized": (!sized.is_empty()).then(|| {
+                let mut m = serde_json::Map::new();
+                for (pct, usd, _, f) in &sized {
+                    let e = m.entry(pct.to_string()).or_insert_with(|| json!({}));
+                    e[format!("{usd}")] = fill_json(f);
+                }
+                m
+            }),
         })).await;
         if filled {
             // The wallet's position once the API has caught up: the reference for its sales.

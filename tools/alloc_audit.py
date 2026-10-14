@@ -1,24 +1,25 @@
 """An independent check of the allocator (src/allocator.rs) by another way: from the paper's
-events, the backtest file and the allocator's rows, it recomputes what each book should have
-done and compares.
+events and the allocator's rows, it recomputes what each book should have done and compares.
 
-  picks     every entry and refusal is of a wallet the book picked that day (or the day before)
+  picks     every entry and refusal is of a wallet the book picked that day (or the day before),
+            the picks made again from the paper's lots closed before the day began
   complete  every paper buy of a picked wallet is in the book: an entry or a refusal
-  sizes     stake = the book's share of its capital (or cut, never under 1/8 nor $1); the capital
-            at entry = $10,000 + the result of the positions closed before; the shares = the
-            book's fill (C3: the paper's at the 3% cap, C10: its own) scaled to the stake
+  sizes     the order = the book's share of its capital (or cut, never under 1/8 nor $1), and
+            what it spent = the order times the share of it the book's fill got; the capital at
+            entry = $10,000 + the result of the positions closed before; the shares = the
+            book's fill (its cap and size, `sized`; else the $1 one at its cap) scaled
   caps      at each entry, with the positions open then (each at the share still open): 2 per
             wallet and outcome, everything 100%, the event the book's limit, the wallet 20%
   pnl       each position's dollars back from the paper's sales and settlement, to the cent
   status    every hourly status's open positions and risk = the replay's at its event
   balance   the state's and every status row's capital = $10,000 + the closed positions' result
 
-DATABASE_URL=... py tools/alloc_audit.py [wallets/backtest_stats.csv]   (read only)"""
+DATABASE_URL=... py tools/alloc_audit.py   (read only)"""
 import os, sys, json, math
 from collections import defaultdict
 import psycopg2
 
-GEN = 1
+GEN = 2
 DEPOSIT, TOTAL_CAP, TRADER_CAP, WALLET_OUTCOME = 10_000.0, 1.0, 0.2, 2
 MIN_SHARE, MIN_USD, MIN_MARKETS, DD_FLOOR, PF_MAX = 1 / 8, 1.0, 20, 1.0, 50.0
 SIZES = [10, 20, 30, 50, 100]
@@ -32,20 +33,63 @@ def bad(check, msg):
     problems[check].append(msg)
 
 
-# --- the picks, recomputed from the backtest file -------------------------------------------
-def read_prior(path):
+# --- the picks, recomputed from the paper -------------------------------------------------
+def paper_records(cur, cut):
+    """Each wallet's record from its paper lots (wallet and outcome) closed before `cut`."""
+    cur.execute("""
+        SELECT wallet, token, kind, extract(epoch FROM at)::float8, condition,
+               coalesce((data->'fill'->>'usd')::float8, 0), coalesce((data->'fill'->>'fee')::float8, 0),
+               (data->>'usd')::float8, (data->>'held_after')::float8
+        FROM events WHERE kind IN ('buy', 'sell', 'settle') AND at < to_timestamp(%s) AND wallet IS NOT NULL""", (cut,))
+    lots = {}
+    for w, t, kind, at, cond, usd, fee, settled, after in cur.fetchall():
+        l = lots.setdefault((w, t), dict(t0=None, t1=None, market=None, cost=0.0, back=0.0, closed=False))
+        if kind == 'buy':
+            l['cost'] += usd + fee
+            if l['t0'] is None or at < l['t0']:
+                l['t0'] = at
+            if cond is not None and (l['market'] is None or cond < l['market']):
+                l['market'] = cond
+        else:
+            l['t1'] = at if l['t1'] is None else max(l['t1'], at)
+            if kind == 'sell':
+                l['back'] += usd - fee
+                l['closed'] |= after is not None and after < 1e-6
+            else:
+                l['back'] += settled or 0.0
+                l['closed'] = True
+    by = defaultdict(list)
+    for (w, _), l in lots.items():
+        if l['closed'] and l['t0'] is not None and l['t1'] is not None and l['cost'] > 0:
+            by[w].append(l)
     out = {}
-    lines = open(path).read().splitlines()
-    head = lines[0].split(',')
-    for l in lines[1:]:
-        f = dict(zip(head, l.split(',')))
-        try:
-            r = {k: float(f[k]) for k in ['n', 'markets', 'cost', 'pnl', 'win', 'loss', 'r2', 'dd', 'pnl30', 'sharpe',
-                                           'sortino', 'weeks']}
-        except (KeyError, ValueError):
-            continue
-        if all(math.isfinite(v) for v in r.values()):
-            out[f['wallet'].strip().lower()] = r
+    for w, ls in by.items():
+        r = dict(n=len(ls), markets=len({l['market'] or '' for l in ls}), cost=sum(l['cost'] for l in ls))
+        pnls = [l['back'] - l['cost'] for l in ls]
+        r['pnl'] = sum(pnls)
+        r['win'] = sum(x for x in pnls if x > 0)
+        r['loss'] = -sum(x for x in pnls if x < 0)
+        r['r2'] = sum((x / l['cost']) ** 2 for x, l in zip(pnls, ls))
+        r['pnl30'] = sum(x for x, l in zip(pnls, ls) if l['t0'] >= cut - 30 * 86400)
+        days, weeks = defaultdict(float), defaultdict(float)
+        for x, l in zip(pnls, ls):
+            d = math.floor(l['t1'] / 86400)
+            days[d] += x
+            weeks[d // 7] += x
+        cum = peak = dd = 0.0
+        for d in sorted(days):
+            cum += days[d]
+            peak = max(peak, cum)
+            dd = max(dd, peak - cum)
+        r['dd'] = dd
+        span = max(math.floor(cut / 86400) - math.floor(min(l['t0'] for l in ls) / 86400), 1)
+        mean = r['pnl'] / span
+        sd = math.sqrt(max(sum(v * v for v in days.values()) / span - mean * mean, 0))
+        down = math.sqrt(sum(min(v, 0) ** 2 for v in days.values()) / span)
+        r['sharpe'] = mean / sd * math.sqrt(365) if sd > 0 else 0.0
+        r['sortino'] = min(mean / down * math.sqrt(365), 99.0) if down > 0 else (99.0 if mean > 0 else 0.0)
+        r['weeks'] = sum(1 for v in weeks.values() if v > 0) / len(weeks)
+        out[w] = r
     return out
 
 
@@ -114,15 +158,20 @@ def parse(book):
 
 
 def fill_of(book, data):
-    """The paper's fill a book takes: C3 the one at the narrow cap (the paper's own without one)."""
-    f = (data.get('narrow') or {}).get('fill') if book.endswith('_C3') and isinstance(data.get('narrow'), dict) else None
+    """The paper's fill a book takes, and the share of its order it got: at its cap and size
+    (`sized`); without one, the $1 fill at its cap (C3: the narrow one, else the paper's own), all."""
+    _, _, stake, _ = parse(book)
+    cap = '3' if book.endswith('_C3') else '10'
+    size = f'{stake * DEPOSIT:g}'
+    f = ((data.get('sized') or {}).get(cap) or {}).get(size)
+    if isinstance(f, dict):
+        return (f.get('usd') or 0) + (f.get('fee') or 0), f.get('shares') or 0, (f.get('usd') or 0) / (stake * DEPOSIT)
+    f = (data.get('narrow') or {}).get('fill') if cap == '3' and isinstance(data.get('narrow'), dict) else None
     f = f or data.get('fill') or {}
-    return (f.get('usd') or 0) + (f.get('fee') or 0), f.get('shares') or 0
+    return (f.get('usd') or 0) + (f.get('fee') or 0), f.get('shares') or 0, 1.0
 
 
 def main():
-    path = sys.argv[1] if len(sys.argv) > 1 else 'wallets/backtest_stats.csv'
-    prior = read_prior(path)
     c = psycopg2.connect(os.environ['DATABASE_URL'])
     cur = c.cursor()
     cur.execute("SELECT data FROM state WHERE id = 'alloc'")
@@ -157,7 +206,7 @@ def main():
 
     def picked(day):
         if day not in day_picks:
-            day_picks[day] = picks_of(prior, day)
+            day_picks[day] = picks_of(paper_records(cur, day * 86400), day)
         return day_picks[day]
 
     # Entries per book, in order, with their paper buy.
@@ -177,7 +226,7 @@ def main():
         day = int(e[1] // 86400)
         for b in books_all():
             s, n, _, _ = parse(b)
-            cost, sh = fill_of(b, e[5] or {})
+            cost, sh, _ = fill_of(b, e[5] or {})
             if cost <= 0 or sh <= 0:
                 continue
             if e[3] in picked(day)[(s, n)]:
@@ -268,6 +317,10 @@ def main():
             risk = lambda f: sum(p['stake'] * p['shares'] / p['shares0'] for p in pos.values() if f(p))
             if row is None:
                 # refused: there must have been no room
+                if dec[3] == 'THIN_BOOK':
+                    if want * fill_of(b, e[5] or {})[2] >= MIN_USD:
+                        bad('sizes', f'{b}: refused {i} (THIN_BOOK) though its fill would spend ${want * fill_of(b, e[5] or {})[2]:.2f}')
+                    continue
                 if dec[3] == 'ADD_CAP':
                     if sum(1 for p in pos.values() if p['wallet'] == e[3] and p['token'] == e[4]) < WALLET_OUTCOME:
                         bad('caps', f'{b}: refused {i} (ADD_CAP) with under 2 positions of the wallet in the outcome')
@@ -281,19 +334,20 @@ def main():
             stake, shares0, cap0 = (row[8], row[9], row[7]) if isinstance(row, tuple) else (row['stake'], row['shares0'], row['capital'])
             if abs(cap0 - capital) > EPS:
                 bad('sizes', f'{b}: entry {i} at capital ${cap0:.2f}, recomputed ${capital:.2f}')
-            cost, sh = fill_of(b, e[5] or {})
+            cost, sh, got = fill_of(b, e[5] or {})
             if cost <= 0 or abs(shares0 - stake / cost * sh) > 1e-6 * max(1, shares0):
                 bad('sizes', f'{b}: entry {i} {shares0:.4f} shares, its fill gives {stake / cost * sh if cost > 0 else 0:.4f}')
-            if stake > want + EPS or stake < max(want * MIN_SHARE, MIN_USD) - EPS:
-                bad('sizes', f'{b}: entry {i} stake ${stake:.2f} for ${want:.2f} wanted')
-            if stake < want - EPS and dec is None:
-                bad('sizes', f'{b}: entry {i} cut to ${stake:.2f} of ${want:.2f}, no decision row')
+            order = stake / min(got, 1.0) if got > 0 else float('inf')
+            if order > want + EPS or order < max(want * MIN_SHARE, MIN_USD) - EPS or stake < MIN_USD - EPS:
+                bad('sizes', f'{b}: entry {i} order ${order:.2f} (spent ${stake:.2f}) for ${want:.2f} wanted')
+            if order < want - EPS and dec is None:
+                bad('sizes', f'{b}: entry {i} cut to ${order:.2f} of ${want:.2f}, no decision row')
             if sum(1 for p in pos.values() if p['wallet'] == e[3] and p['token'] == e[4]) >= WALLET_OUTCOME:
                 bad('caps', f'{b}: entry {i} a 3rd position of {e[3][:10]} in one outcome')
             for name, used, cap in [('total', risk(lambda p: True), TOTAL_CAP), ('event', risk(lambda p: p['event'] == event), event_cap),
                                     ('wallet', risk(lambda p: p['wallet'] == e[3]), TRADER_CAP)]:
-                if used + stake > cap * capital + EPS:
-                    bad('caps', f'{b}: entry {i} takes {name} to ${used + stake:.2f} over ${cap * capital:.2f}')
+                if used + order > cap * capital + EPS:
+                    bad('caps', f'{b}: entry {i} takes {name} to ${used + order:.2f} over ${cap * capital:.2f}')
             pos[i] = dict(id=i, wallet=e[3], token=e[4], market=market, event=event, stake=stake, shares0=shares0,
                           shares=shares0, back=0.0)
         # what is still open must be the state's

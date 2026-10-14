@@ -25,7 +25,7 @@
 //! nothing else: the trials stand still, and live buys nothing new, only follows its held lots
 //! to their sale or settlement and redeems them.
 //!
-//! With --alloc-prior (the backtest's per wallet sums) the allocator (allocator.rs) ranks the wallets daily
+//! With --alloc the allocator (allocator.rs) ranks the wallets daily by their copies on paper
 //! and keeps 990 virtual portfolios over the paper's copies: which wallets to copy, and how much.
 
 mod allocator;
@@ -404,20 +404,15 @@ async fn run(cfg: config::Config) -> anyhow::Result<()> {
         });
     }
 
-    match (&db_url, &cfg.alloc_prior) {
-        (Some(url), Some(path)) => match allocator::read_prior(path) {
-            Ok(prior) => {
-                log!("alloc: prior of {} wallets from {}", prior.len(), path.display());
-                // The wallets the books may pick are bought at the wide cap, the narrow alongside.
-                let wide = allocator::pickable(&prior);
-                log!("paper: {} wallets bought at a cap of {}% (and {}% alongside)", wide.len(), engine::WIDE_CAP * 100.0,
-                    engine::NARROW_CAP * 100.0);
-                *paper.wide.lock().await = wide;
-                tokio::spawn(allocator::run(url.clone(), api.clone(), prior));
-            }
-            Err(e) => log!("alloc: OFF, {} not read: {e}", path.display()),
-        },
-        (None, Some(_)) => log!("alloc: OFF, needs DATABASE_URL"),
+    match (&db_url, cfg.alloc) {
+        (Some(url), true) => {
+            // It picks the wallets each day and sets which the paper buys at the wide cap and
+            // the books' sizes (engine.rs).
+            log!("paper: the wallets the books may pick are bought at a cap of {}% (and {}% alongside), at $1 and the \
+                  books' sizes", engine::WIDE_CAP * 100.0, engine::NARROW_CAP * 100.0);
+            tokio::spawn(allocator::run(url.clone(), api.clone(), paper.clone()));
+        }
+        (None, true) => log!("alloc: OFF, needs DATABASE_URL"),
         _ => {}
     }
 

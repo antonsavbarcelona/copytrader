@@ -37,10 +37,10 @@ Report on the server's data from anywhere, with the database's public URL:
 DATABASE_URL=postgresql://... target/release/copytrader report
 ```
 
-## What the image runs now: the backtest's wallets and the allocator
+## What the image runs now: the paper of 14k wallets and the allocator
 
 The `Dockerfile` runs with `--no-scout --wallets-file wallets/all.txt --poll-file
-wallets/picks.txt --alloc-prior wallets/backtest_stats.csv`:
+wallets/picks.txt --alloc`:
 
 - The paper copies every wallet in `all.txt` (14,254: active since 2026-09-10 with enough
   history for the 90-day copy backtest) at $1; the REST read-back reads only `picks.txt`
@@ -51,25 +51,28 @@ wallets/picks.txt --alloc-prior wallets/backtest_stats.csv`:
   (details below): every closed position in `alloc_trades`, the cut and refused entries in
   `alloc_decisions`, every book's status each hour in `alloc_status`.
 
-### The allocator, generation 1 (the scheme of hl-copytrader's generation 4)
+### The allocator, generation 2 (picks by the paper, at the books' sizes)
 
-**Who is picked.** Only the 90-day backtest of the copy (`wallets/backtest_stats.csv`, from
-`research/build2.py` then `research/stats.py`): our simulated copy's result, not the trader's.
-The paper does not enter the picks. One filter for all: the copy made money (3,412 of 14,254;
-all the copies together lost 3.4%). Each score's own filter is only what it cannot be computed
-without: 20+ distinct markets for the scores that divide by risk, by the copies or lean on time
-(3,249 wallets); none for PNL and PNL30. The picks are made each day (the random draws change).
+Generation 1 (2026-10-13/14) picked by the 90-day backtest; its first day said what the
+checks had: the backtest was far kinder to the wallets it ranked best than their copies on
+paper (`research/README.md`), so generation 2 picks by the paper alone.
+
+**Who is picked.** Each day (UTC), the paper's own copy of every wallet: its lots (wallet and
+outcome) entered and closed before the day began, at $1, with the real fills, misses and fees.
+One filter for all: the copy made money. Each score's own filter is only what it cannot be
+computed without: 20+ distinct markets for the scores that divide by risk, by the copies or
+lean on time; none for PNL and PNL30.
 
 | score | formula |
 |---|---|
 | PNL | the copy's result |
-| PNL30 | of the copies entered in the backtest's last 30 days |
+| PNL30 | of the lots entered in the last 30 days |
 | LCB | mean return - 2 sd / sqrt(n) |
 | EXPDD | (pnl / n) / max(drawdown, $1) |
 | PNLSQRTN | mean return * sqrt(n) |
 | TSTAT | mean / sd * sqrt(n) |
 | PF | wins / losses, at most 50 |
-| SHARPE, SORTINO | of the daily result over the 90 days, a year |
+| SHARPE, SORTINO | of the daily result (by the day a lot closed, from its first lot), a year |
 | CALMAR | pnl / max(drawdown, $1) |
 | WEEKS | the share of weeks in profit |
 | COMBO | the mean percentile of the 11 above |
@@ -79,41 +82,41 @@ without: 20+ distinct markets for the scores that divide by risk, by the copies 
 event limit of 20/50/100% x a buy cap of 3% or 10% over the trader's price = 1980 books
 (`LCB_20_R0.5_E20_C10`). One pick takes the same wallets at every stake, limit and cap.
 
-**The buy cap.** The paper buys every other wallet at most 2% over the trader's price; the
-wallets in profit (those a book may pick) at 10%, and fills the same order book at 3%
-alongside (`narrow` in the buy event, with its own retry). A `_C10` book takes the paper's
-fill, a `_C3` book the 3% one: the two show what paying up to 10% brings.
+**The fills, at the books' sizes.** The paper buys every other wallet at $1 at most 2% over the
+trader's price. The wallets a book may pick (the copy in profit) it buys at 10%, and on the
+same order book it fills $50, $100 and $200 too (the books' stakes, 0.5/1/2% of $10,000) at 3%
+and at 10%, each with its own retry (`sized` in the buy event). A book takes the fill of its
+cap and size: its price, and as much of its order as the book held then.
 
 **An entry.** A buy the paper copied of a picked wallet, each book apart (capital = $10,000 +
 the closed positions' result; a position's risk = its stake times the share still open):
 the wallet's entry and one add in this outcome open already -> `ADD_CAP` (other wallets in it
-are apart); the stake is cut to the room under
-everything open <= 100% (`TOTAL_CAP`), the event <= the book's limit (`EVENT_CAP`) and the
-wallet <= 20% (`TRADER_CAP`); under 1/8 of the stake or $1 it is refused. The position is the
-paper's buy scaled to the stake, sold as the paper sells (the same share, at its price) and
-paid out at the settlement. No stop: a lost outcome burns the stake, which is the risk. A wallet that leaves the
-picks gets no new entries; its open positions run to the end.
+are apart); the order is cut to the room under everything open <= 100% (`TOTAL_CAP`), the
+event <= the book's limit (`EVENT_CAP`) and the wallet <= 20% (`TRADER_CAP`); under 1/8 of the
+stake or $1 it is refused. It fills as the book's fill did (a thin book: the same share of the
+order; under $1 spent: `THIN_BOOK`). The position is sold as the paper sells (the same share,
+at the $1 lot's price: the sales are not filled at the books' sizes) and paid out at the
+settlement. No stop: a lost outcome burns the stake, which is the risk. A wallet that leaves
+the picks gets no new entries; its open positions run to the end.
 
-**The verdict** (fixed before the start, 2026-10-13). Each score's book gets a place among
-the 10 random draws of the same size, stake and limit: how many of them it is ahead of by
+**The verdict** (fixed before the start, 2026-10-14). Each score's book gets a place among
+the 10 random draws of the same size, stake, limit and cap: how many of them it is ahead of by
 return (open positions at the market's price), 0-10, a random pick 5 on average. After **21
 days** a score works if its **mean place over its 90 books is 7.5+** and **over 5 on 4 of the
 5 sizes**. One lucky cell is not believed: of 1,080 scored books some beat the draws by chance.
-The stakes and limits are compared apart, by return and drawdown, for the scores and the
-draws.
+And a score that works is worth money only if its books also made money: the random draws are
+the control for the picking, not for the copying, which lost about 4% a copy on average on
+paper (2026-10-02/14).
 
 ```
 DATABASE_URL=postgresql://... target/release/copytrader alloc                # places and verdicts
 DATABASE_URL=postgresql://... target/release/copytrader alloc --score LCB    # its 90 books
-DATABASE_URL=postgresql://... target/release/copytrader alloc --detail LCB_20_R0.5_E20_C10
-DATABASE_URL=postgresql://... py tools/alloc_audit.py   # picks, entries, sizes, caps, pnl, balance by another way
-DATABASE_URL=postgresql://... py tools/alloc_vs_backtest.py   # the paper against the backtest's books
+DATABASE_URL=postgresql://... target/release/copytrader alloc --detail LCB_20_R0.5_E20_C10   # by trader
+DATABASE_URL=postgresql://... py tools/alloc_audit.py   # picks, entries, sizes, caps, pnl, statuses, balance by another way
 ```
 
-The backtest of the same 990 books (no buy cap: both caps' books are set against it) (`research/grid_backtest.csv`, days 30-90 of the 90) made
-every score look far better than the random draws; the paper is known to fall short of it for
-the picked wallets (`research/README.md`). The paper decides; `alloc_vs_backtest.py` shows how
-much of the backtest's result each score keeps.
+Generation 1's rows stay in the tables (`gen` = 1); `tools/alloc_vs_backtest.py` sets its
+books against the backtest's (`research/grid_backtest.csv`).
 
 ## Round one: the big players
 

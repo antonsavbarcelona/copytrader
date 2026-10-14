@@ -25,10 +25,11 @@ for i, l in enumerate(open(os.path.join(HERE, '..', 'research', 'grid_backtest.c
 
 c = psycopg2.connect(os.environ['DATABASE_URL'])
 cur = c.cursor()
-cur.execute("SELECT data->>'since' FROM state WHERE id = 'alloc' AND (data->>'generation')::int = %s", (GEN,))
+# The generation began at its first status (the allocator writes one as it starts).
+cur.execute("SELECT extract(epoch FROM min(at))::float8 FROM alloc_status WHERE gen = %s", (GEN,))
 row = cur.fetchone()
-if not row:
-    sys.exit(f'no generation {GEN} state yet')
+if not row or row[0] is None:
+    sys.exit(f'no generation {GEN} statuses')
 cur.execute("SELECT book, equity, extract(epoch FROM at)::float8 FROM alloc_status WHERE gen = %s ORDER BY at", (GEN,))
 paper, peak, dd, last_at = {}, defaultdict(lambda: DEPOSIT), defaultdict(float), 0.0
 for b, eq, at in cur.fetchall():
