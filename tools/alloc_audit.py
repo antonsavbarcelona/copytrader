@@ -3,7 +3,8 @@ events and the allocator's rows, it recomputes what each book should have done a
 
   picks     every entry and refusal is of a wallet the book picked that day (or the day before),
             the picks made again from the paper's lots closed before the day began
-  complete  every paper buy of a picked wallet is in the book: an entry or a refusal
+  complete  every paper buy of a picked wallet the book did not take (a refusal: counted, not
+            written, since 2026-10-15) had no room, and their number = the state's count
   sizes     the order = the book's share of its capital (or cut, never under 1/8 nor $1), and
             what it spent = the order times the share of it the book's fill got; the capital at
             entry = $10,000 + the result of the positions closed before; the shares = the
@@ -148,7 +149,8 @@ def expand(st):
             at, wallet, token, market, event = lots[str(i)]
             out.append(dict(id=i, at=at, wallet=wallet, token=token, market=market, event=event, price=price, capital=capital,
                             stake=stake, shares0=shares0, shares=shares, back=back))
-        books[name] = dict(realized=realized, entries=entries, cuts=cuts, refusals=refusals, closed=closed, positions=out)
+        books[name] = dict(realized=realized, entries=entries, cuts=cuts, refusals=refusals, closed=closed, positions=out,
+                           refused=(st.get('refused') or {}).get(name, {}))
     return dict(st, books=books)
 
 
@@ -219,7 +221,13 @@ def main():
 
     # picks and completeness
     first_ev = min((e[0] for e in events), default=0)
-    by_wallet_books = defaultdict(set)
+    untaken = defaultdict(list)  # book -> paper buys it did not take (refusals)
+    # The event of each paper buy, from any book that took it (a refusal's own is not kept).
+    event_of = {}
+    for t in trades.values():
+        event_of[t[1]] = t[6]
+    for (_, i), o in opened.items():
+        event_of[i] = o['event']
     for e in events:
         if e[2] != 'buy':
             continue
@@ -232,9 +240,9 @@ def main():
             if e[3] in picked(day)[(s, n)]:
                 k = (b, e[0])
                 if k not in trades and k not in opened and k not in decisions:
-                    # the allocator may have made the day's picks a little after midnight
-                    if e[3] not in picked(day - 1)[(s, n)]:
-                        bad('complete', f'{b}: paper buy {e[0]} of {e[3][:10]} neither taken nor refused')
+                    # Refused, counted only: checked in the replay (the allocator may have made the
+                    # day's picks a little after midnight: those of the day before then).
+                    untaken[b].append(e[0])
     for k in list(trades) + list(opened) + list(decisions):
         b, i = k
         e = ev_by_id.get(i)
@@ -264,9 +272,30 @@ def main():
         realized = 0.0
         # The book's timeline: its entries and refusals, and the paper's sales of what it holds.
         timeline = sorted([(i, 'entry') for i in ids] + [(x[0], 'paper', key) for key, v in sells.items() for x in v]
-                          + statuses[b], key=lambda x: x[0])
+                          + statuses[b] + [(i, 'untaken') for i in untaken[b]], key=lambda x: x[0])
+        unexplained = 0
         for item in timeline:
             i = item[0]
+            if item[1] == 'untaken':
+                # A refusal: the wallet's 2 in the outcome, too thin a book, or no room under a cap.
+                e = ev_by_id[i]
+                capital = DEPOSIT + realized
+                want = stake_share * capital
+                if sum(1 for p in pos.values() if p['wallet'] == e[3] and p['token'] == e[4]) >= WALLET_OUTCOME:
+                    continue
+                risk = lambda f: sum(p['stake'] * p['shares'] / p['shares0'] for p in pos.values() if f(p))
+                room = min(TOTAL_CAP * capital - risk(lambda p: True), TRADER_CAP * capital - risk(lambda p: p['wallet'] == e[3]))
+                if room < max(want * MIN_SHARE, MIN_USD):
+                    continue
+                # The order cut to the room, as deep as the book went at the book's size.
+                if min(want, room) * fill_of(b, e[5] or {})[2] < MIN_USD:
+                    continue
+                ev = event_of.get(i)
+                if ev is None:
+                    unexplained += 1  # perhaps the event's cap: its event is not known here
+                elif event_cap * capital - risk(lambda p: p['event'] == ev) >= max(want * MIN_SHARE, MIN_USD):
+                    bad('caps', f'{b}: paper buy {i} not taken with room ${room:.2f} for ${want:.2f}')
+                continue
             if item[1] == 'status':
                 lid, risk_at, n_at = item[2]
                 risk_now = sum(p['stake'] * p['shares'] / p['shares0'] for p in pos.values())
@@ -318,7 +347,10 @@ def main():
             if row is None:
                 # refused: there must have been no room
                 if dec[3] == 'THIN_BOOK':
-                    if want * fill_of(b, e[5] or {})[2] >= MIN_USD:
+                    # The order cut to the room (the event's too: its cap is not known here, so
+                    # only a full order that would have spent $1+ is wrong).
+                    room = min(TOTAL_CAP * capital - risk(lambda p: True), TRADER_CAP * capital - risk(lambda p: p['wallet'] == e[3]))
+                    if min(want, room) * fill_of(b, e[5] or {})[2] >= MIN_USD and room >= want:
                         bad('sizes', f'{b}: refused {i} (THIN_BOOK) though its fill would spend ${want * fill_of(b, e[5] or {})[2]:.2f}')
                     continue
                 if dec[3] == 'ADD_CAP':
@@ -358,6 +390,11 @@ def main():
             elif abs(o['back'] - p['back']) > EPS or abs(o['shares'] - p['shares']) > 1e-4:
                 bad('pnl', f'{b}: open position {i} back/shares {o["back"]:.4f}/{o["shares"]:.4f}, recomputed '
                            f'{p["back"]:.4f}/{p["shares"]:.4f}')
+        counted = sum((st['books'].get(b, {}).get('refused') or {}).values())
+        if abs(len(untaken[b]) - counted) > max(5, 0.005 * counted):
+            bad('complete', f'{b}: {len(untaken[b])} picked buys not taken, the state counted {counted} refusals')
+        if unexplained:
+            problems.setdefault('_unexplained', []).append(unexplained)
         got = st['books'].get(b, {}).get('realized', 0.0)
         if abs(got - realized) > EPS:
             bad('balance', f'{b}: the state realized ${got:.2f}, recomputed ${realized:.2f}')
@@ -374,6 +411,7 @@ def main():
             bad('balance', f'{b}: status at event {lid} capital ${cap:.2f}, recomputed ${want:.2f}')
 
     print(f'{len(rows)} status rows, {len(events)} paper events read')
+    print(f"refusals whose event (its cap) could not be checked: {sum(problems.pop('_unexplained', []))}")
     for check in ['picks', 'complete', 'sizes', 'caps', 'pnl', 'status', 'balance']:
         v = problems[check]
         print(f'{check:9} {"OK" if not v else f"{len(v)} problems"}')

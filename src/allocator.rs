@@ -45,8 +45,9 @@
 //! A wallet that leaves the picks gets no new positions; the open ones go on to its sale or
 //! the settlement.
 //!
-//! Tables: `alloc_trades` every closed position, `alloc_decisions` only the cut and refused
-//! ones, `alloc_status` every book each hour. Every row has the generation: new rules, new
+//! Tables: `alloc_trades` every closed position, `alloc_decisions` only the cut entries (the
+//! refusals are counted by reason in the state, `refused`: tens of thousands an hour),
+//! `alloc_status` every book each hour. Every row has the generation: new rules, new
 //! generation, the books start again. The state is saved every 15 minutes; after a restart the
 //! events since are read again (the rows already written are kept). `copytrader alloc` judges
 //! the scores (README).
@@ -389,6 +390,8 @@ struct BookState {
     cuts: u64,
     refusals: u64,
     closed: u64,
+    /// The refusals by reason (they are not written one by one: tens of thousands an hour).
+    refused: HashMap<String, u64>,
 }
 
 impl BookState {
@@ -459,6 +462,9 @@ struct Saved {
     status_at: f64,
     lots: HashMap<i64, (f64, String, String, String, String)>,
     books: HashMap<String, SavedBook>,
+    /// book -> reason -> refusals.
+    #[serde(default)]
+    refused: HashMap<String, HashMap<String, u64>>,
 }
 
 impl Saved {
@@ -479,7 +485,9 @@ impl Saved {
                 (name.clone(), (b.realized, b.entries, b.cuts, b.refusals, b.closed, pos))
             })
             .collect();
-        Saved { generation: s.generation, last_id: s.last_id, since: s.since, first_id: s.first_id, status_at: s.status_at, lots, books }
+        let refused = s.books.iter().filter(|(_, b)| !b.refused.is_empty()).map(|(n, b)| (n.clone(), b.refused.clone())).collect();
+        Saved { generation: s.generation, last_id: s.last_id, since: s.since, first_id: s.first_id, status_at: s.status_at, lots, books,
+            refused }
     }
 
     fn state(self) -> Result<State> {
@@ -493,7 +501,8 @@ impl Saved {
                     Ok(Position { id, at, wallet, token, market, event, price, capital, stake, shares0, shares, back })
                 })
                 .collect::<Result<Vec<_>>>()?;
-            books.insert(name, BookState { realized, positions, entries, cuts, refusals, closed });
+            let refused = self.refused.get(&name).cloned().unwrap_or_default();
+            books.insert(name, BookState { realized, positions, entries, cuts, refusals, closed, refused });
         }
         Ok(State { generation: self.generation, last_id: self.last_id, since: self.since, first_id: self.first_id,
             status_at: self.status_at, books,
@@ -628,28 +637,33 @@ async fn save(c: &Client, s: &mut State) -> Result<()> {
     Ok(())
 }
 
+/// The picks of `day`, by the paper's lots closed before it began; the day that is now's also
+/// set which wallets the paper buys at the wide cap and the books' sizes.
+async fn make_picks(c: &Client, paper: &Engine, books: &[Book], s: &mut State, day: i64) -> Result<()> {
+    let cut = day as f64 * 86400.0;
+    let prior: HashMap<String, Record> = paper_lots(c, cut).await?.iter().map(|(w, l)| (w.clone(), record(l, cut))).collect();
+    if day == (now() / 86400.0) as i64 {
+        *paper.wide.lock().await = pickable(&prior);
+    }
+    let p = picks(&prior, day);
+    s.picked.clear();
+    for (i, b) in books.iter().enumerate() {
+        for w in &p[&(b.score, b.size)] {
+            s.picked.entry(w.clone()).or_default().push(i);
+        }
+    }
+    s.day = day;
+    let through = |f: &dyn Fn(&Record) -> bool| prior.values().filter(|r| f(r)).count();
+    log!("alloc: picks for day {day}: {} wallets with closed paper lots, {} in profit, {} of them with {MIN_MARKETS}+ markets; \
+          {} wallets in some book", prior.len(), through(&|r| r.in_profit()),
+        through(&|r| r.in_profit() && r.markets >= MIN_MARKETS), s.picked.len());
+    Ok(())
+}
+
 async fn step(c: &Client, api: &Api, paper: &Engine, books: &[Book], s: &mut State) -> Result<()> {
     let day = (now() / 86400.0) as i64;
-    if s.day != day {
-        // The day's records: the paper's lots closed before it began.
-        let cut = day as f64 * 86400.0;
-        let records: HashMap<String, Record> =
-            paper_lots(c, cut).await?.iter().map(|(w, l)| (w.clone(), record(l, cut))).collect();
-        let prior = &records;
-        // The wallets the books may pick are bought at the wide cap and the books' sizes.
-        *paper.wide.lock().await = pickable(prior);
-        let p = picks(prior, day);
-        s.picked.clear();
-        for (i, b) in books.iter().enumerate() {
-            for w in &p[&(b.score, b.size)] {
-                s.picked.entry(w.clone()).or_default().push(i);
-            }
-        }
-        s.day = day;
-        let through = |f: &dyn Fn(&Record) -> bool| prior.values().filter(|r| f(r)).count();
-        log!("alloc: picks for day {day}: {} wallets with closed paper lots, {} in profit, {} of them with {MIN_MARKETS}+ markets; \
-              {} wallets in some book", prior.len(), through(&|r| r.in_profit()),
-            through(&|r| r.in_profit() && r.markets >= MIN_MARKETS), s.picked.len());
+    if s.day == 0 {
+        make_picks(c, paper, books, s, day).await?;
     }
     if now() - s.status_at >= HOUR {
         status(c, api, books, s).await?;
@@ -696,6 +710,12 @@ async fn step(c: &Client, api: &Api, paper: &Engine, books: &[Book], s: &mut Sta
                 if (usd + fee <= 0.0 || shares <= 0.0) && (n_usd + n_fee <= 0.0 || n_shares <= 0.0) {
                     continue;
                 }
+                // A buy is judged by the picks of its own day (a restart reads the events since
+                // the state was saved, perhaps of the day before).
+                let d = (at / 86400.0).floor() as i64;
+                if d != s.day {
+                    make_picks(c, paper, books, s, d).await?;
+                }
                 let Some(idx) = s.picked.get(&wallet).cloned() else {
                     s.not_picked += 1;
                     continue;
@@ -722,9 +742,14 @@ async fn step(c: &Client, api: &Api, paper: &Engine, books: &[Book], s: &mut Sta
                     } else {
                         bs.refusals += 1;
                     }
-                    if let Some((reason, wanted, granted)) = why {
-                        decided.push(Decision { book: b.name.clone(), id, wallet: wallet.clone(), token: token.clone(),
-                            market: market.clone(), event: event.clone(), wanted, granted, reason });
+                    // A cut entry is written; a refusal only counted.
+                    match why {
+                        Some((reason, wanted, granted)) if pos.is_some() => {
+                            decided.push(Decision { book: b.name.clone(), id, wallet: wallet.clone(), token: token.clone(),
+                                market: market.clone(), event: event.clone(), wanted, granted, reason });
+                        }
+                        Some((reason, ..)) => *bs.refused.entry(reason.to_string()).or_default() += 1,
+                        None => {}
                     }
                 }
             }
@@ -975,14 +1000,17 @@ pub async fn report(url: &str, args: &[String]) -> Result<()> {
                 (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4), r.get(5));
             println!("  {} {} {p:.3} ${st:.2} -> {pnl:+.2} {why}", &at[..16], &w[..10]);
         }
-        println!("\ncut or refused:");
+        println!("\ncut (rows) or refused (counted; rows before 2026-10-15):");
         for r in c
-            .query("SELECT reason, count(*) FROM alloc_decisions WHERE gen = $1 AND book = $2
-                    GROUP BY 1 ORDER BY 2 DESC", &[&GEN, &name])
+            .query("SELECT reason, count(*) FILTER (WHERE granted > 0), count(*) FILTER (WHERE granted = 0) FROM alloc_decisions
+                    WHERE gen = $1 AND book = $2 GROUP BY 1 ORDER BY 2 DESC", &[&GEN, &name])
             .await?
         {
-            let (why, n): (String, i64) = (r.get(0), r.get(1));
-            println!("  {why:22} {n}");
+            let (why, cut, refused): (String, i64, i64) = (r.get(0), r.get(1), r.get(2));
+            println!("  {why:22} {cut} cut, {refused} refused");
+        }
+        for (why, n) in &bs.refused {
+            println!("  {why:22} {n} refused");
         }
         return Ok(());
     }
@@ -1076,11 +1104,24 @@ pub async fn report(url: &str, args: &[String]) -> Result<()> {
     }
 
     println!("\nCut or refused, all books:");
-    for r in c.query("SELECT reason, count(*), count(*) FILTER (WHERE granted > 0) FROM alloc_decisions WHERE gen = $1
-                      GROUP BY 1 ORDER BY 2 DESC", &[&GEN]).await?
+    // Cuts are rows; refusals are counted in the state (rows only before 2026-10-15).
+    let mut by: HashMap<String, (i64, i64)> = HashMap::new();
+    for r in c.query("SELECT reason, count(*) FILTER (WHERE granted = 0), count(*) FILTER (WHERE granted > 0) FROM alloc_decisions
+                      WHERE gen = $1 GROUP BY 1", &[&GEN]).await?
     {
-        let (why, n, cut): (String, i64, i64) = (r.get(0), r.get(1), r.get(2));
-        println!("  {why:22} {:8} refused, {cut:8} cut", n - cut);
+        let e = by.entry(r.get(0)).or_default();
+        e.0 += r.get::<_, i64>(1);
+        e.1 += r.get::<_, i64>(2);
+    }
+    for b in s.books.values() {
+        for (why, n) in &b.refused {
+            by.entry(why.clone()).or_default().0 += *n as i64;
+        }
+    }
+    let mut rows: Vec<(String, (i64, i64))> = by.into_iter().collect();
+    rows.sort_by_key(|r| -(r.1.0 + r.1.1));
+    for (why, (refused, cut)) in rows {
+        println!("  {why:22} {refused:8} refused, {cut:8} cut");
     }
     Ok(())
 }
@@ -1116,7 +1157,7 @@ mod tests {
         let p = Position { stake: 33.15, shares0: 0.1 + 0.2, shares: 1.0 / 3.0, back: 2.0f64.sqrt(), capital: 10_165.75, price: 0.123,
             ..pos("w", "m", "e") };
         s.books.insert("A".into(), BookState { realized: -1.0 / 7.0, positions: vec![p.clone()], entries: 3, cuts: 1, refusals: 2,
-            closed: 4 });
+            closed: 4, refused: HashMap::from([("TOTAL_CAP".to_string(), 2)]) });
         s.books.insert("B".into(), BookState { positions: vec![Position { stake: 5.0, ..p.clone() }], ..Default::default() });
         let v = serde_json::to_value(Saved::of(&s)).unwrap();
         assert_eq!(v["lots"].as_object().unwrap().len(), 1);
@@ -1127,6 +1168,8 @@ mod tests {
         assert_eq!((x.id, x.at, &x.wallet, &x.token, &x.market, &x.event), (y.id, y.at, &y.wallet, &y.token, &y.market, &y.event));
         assert_eq!((x.price, x.capital, x.stake, x.shares0, x.shares, x.back), (y.price, y.capital, y.stake, y.shares0, y.shares, y.back));
         assert_eq!(back.books["B"].positions[0].stake, 5.0);
+        assert_eq!(back.books["A"].refused["TOTAL_CAP"], 2);
+        assert!(back.books["B"].refused.is_empty());
         assert_eq!((back.last_id, back.since, back.status_at), (9, 1.5, 2.5));
     }
 
